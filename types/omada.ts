@@ -46,7 +46,8 @@ export interface OmadaClientDevice {
   channel?: number;
   rxRate?: number;
   txRate?: number;
-  activity?: number; // Instantaneous rate in Bytes/sec
+  activity?: number; // Instantaneous download rate in Bytes/sec
+  uploadActivity?: number; // Instantaneous upload rate in Bytes/sec
   trafficDown?: number; // Cumulative downloaded bytes
   trafficUp?: number; // Cumulative uploaded bytes
   uptime?: number; // Uptime in seconds
@@ -71,7 +72,8 @@ export interface OmadaDeviceItem {
   model: string;
   showModel?: string;
   ip: string;
-  status: number; // e.g. 14 = connected, 15 = isolated
+  status: number; // v5 codes: 0 = disconnected, 14-17 = connected variants, 30-33 = heartbeat missed, 40-43 = isolated
+  statusCategory?: number; // 0 = disconnected, 1 = connected, 2 = pending, 3 = heartbeat missed, 4 = isolated
   statusStr?: string;
   clientNum?: number;
   cpuUtil?: number;
@@ -140,6 +142,7 @@ export interface OmadaTopologyNode {
   model: string;
   ip?: string;
   status?: number;
+  statusCategory?: number;
   clientCount?: number;
   uplinkPort?: string | number;
   successors?: OmadaTopologyNode[];
@@ -161,7 +164,7 @@ export interface OmadaLanNetwork {
 export interface OmadaSsidSetting {
   id: string;
   name: string;
-  band: number; // 1 = 2.4G, 2 = 5G, 3 = 2.4G+5G, 7 = 6G
+  band: number; // bitmask: 1 = 2.4G, 2 = 5G, 4 = 6G (3 = 2.4G+5G, 7 = tri-band 2.4G+5G+6G)
   bandText?: string;
   security: number;
   securityText?: string;
@@ -184,6 +187,7 @@ export interface PoeDeviceBudget {
   memUtil?: number;
   uptime?: number;
   status: number;
+  statusCategory?: number;
 }
 
 export interface WanPortInfo {
@@ -194,9 +198,9 @@ export interface WanPortInfo {
   ip: string;
   gateway: string;
   dns: string[];
-  proto: 'DHCP' | 'Static' | 'PPPoE';
-  latencyMs: number;
-  packetLossPercent: number;
+  proto: 'DHCP' | 'Static' | 'PPPoE' | 'Unknown';
+  latencyMs?: number; // undefined when the controller does not report it
+  packetLossPercent?: number; // undefined when the controller does not report it
   rxRate: number; // Bytes/sec
   txRate: number; // Bytes/sec
   uptime: number; // seconds
@@ -209,7 +213,7 @@ export interface WanStatusInfo {
   primaryWan: WanPortInfo;
   backupWan?: WanPortInfo;
   dualWanMode: 'Failover' | 'Load Balancing';
-  overallUptimePercent: number;
+  overallUptimePercent?: number; // undefined when not reported by the controller
 }
 
 export interface NocEventItem {

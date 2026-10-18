@@ -3,6 +3,7 @@
 import React, { useState } from 'react';
 import { OmadaClientDevice, OmadaLanNetwork } from '@/types/omada';
 import { formatBytes, formatRate, formatUptime, formatMac } from '@/lib/omada/formatters';
+import { copyText, formatLinkRateKbps, MISSING_VALUE } from './uiHelpers';
 
 interface ClientInspectorModalProps {
   client: OmadaClientDevice | null;
@@ -15,15 +16,18 @@ export default function ClientInspectorModal({
   networks = [],
   onClose,
 }: ClientInspectorModalProps) {
-  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [copyResult, setCopyResult] = useState<{ key: string; ok: boolean } | null>(null);
 
   if (!client) return null;
 
-  const handleCopy = (text: string, key: string) => {
-    navigator.clipboard?.writeText(text);
-    setCopiedKey(key);
-    setTimeout(() => setCopiedKey(null), 2000);
+  const handleCopy = async (text: string, key: string) => {
+    const ok = await copyText(text);
+    setCopyResult({ key, ok });
+    setTimeout(() => setCopyResult((prev) => (prev?.key === key ? null : prev)), 2000);
   };
+
+  const copyLabel = (key: string) =>
+    copyResult?.key === key ? (copyResult.ok ? '✓' : 'Failed') : 'Copy';
 
   // Resolve VLAN description
   const vlan = networks.find((n) => n.vlan === (client.vlanId ?? 1));
@@ -41,13 +45,13 @@ export default function ClientInspectorModal({
       case 4:
         return 'Wi-Fi 4 (802.11n)';
       default:
-        return client.wireless ? 'Wi-Fi 6 (802.11ax)' : '1000BASE-T (Gigabit Ethernet)';
+        return client.wireless ? 'Wi-Fi (standard not reported)' : 'Wired Ethernet';
     }
   };
 
   // Signal Strength Quality
   const getRssiQuality = (rssi?: number) => {
-    if (rssi === undefined) return { label: 'Wired Connection', color: 'text-emerald-400', pct: 100 };
+    if (rssi === undefined || rssi === null) return { label: 'Signal not reported', color: 'text-slate-400', pct: 0 };
     if (rssi >= -60) return { label: 'Excellent (-50 to -60 dBm)', color: 'text-emerald-400', pct: 95 };
     if (rssi >= -70) return { label: 'Good (-60 to -70 dBm)', color: 'text-cyan-400', pct: 75 };
     if (rssi >= -80) return { label: 'Fair (-70 to -80 dBm)', color: 'text-amber-400', pct: 45 };
@@ -55,6 +59,19 @@ export default function ClientInspectorModal({
   };
 
   const signal = getRssiQuality(client.rssi);
+
+  // Attachment point as reported by the controller: AP (+SSID) for Wi-Fi, switch (+port) for wired
+  const getUplinkHop = (): string | null => {
+    if (client.wireless) {
+      const ap = client.apName || (client.apMac ? formatMac(client.apMac) : '');
+      if (!ap) return null;
+      return client.ssid ? `${ap} (SSID: ${client.ssid})` : ap;
+    }
+    const sw = client.switchName || (client.switchMac ? formatMac(client.switchMac) : '');
+    if (!sw) return null;
+    return typeof client.port === 'number' ? `${sw} Port ${client.port}` : sw;
+  };
+  const uplinkHop = getUplinkHop();
 
   // Vendor OUI inference from MAC or Name
   const getVendorName = () => {
@@ -116,7 +133,7 @@ export default function ClientInspectorModal({
                 onClick={() => handleCopy(client.ip, 'ip')}
                 className="text-[10px] text-cyan-400 hover:underline cursor-pointer"
               >
-                {copiedKey === 'ip' ? '✓' : 'Copy'}
+                {copyLabel('ip')}
               </button>
             </div>
           </div>
@@ -129,7 +146,7 @@ export default function ClientInspectorModal({
                 onClick={() => handleCopy(client.mac, 'mac')}
                 className="text-[10px] text-cyan-400 hover:underline cursor-pointer"
               >
-                {copiedKey === 'mac' ? '✓' : 'Copy'}
+                {copyLabel('mac')}
               </button>
             </div>
           </div>
@@ -168,37 +185,37 @@ export default function ClientInspectorModal({
             </div>
 
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-2 text-[11px] text-slate-400">
-              <div>RSSI: <strong className="text-slate-200">{client.rssi !== undefined ? `${client.rssi} dBm` : '-58 dBm'}</strong></div>
-              <div>SNR: <strong className="text-slate-200">{client.snr !== undefined ? `${client.snr} dB` : '38 dB'}</strong></div>
-              <div>PHY Tx Rate: <strong className="text-emerald-400">{client.txRate ? formatRate(client.txRate * 125) : '1.2 Gbps'}</strong></div>
-              <div>PHY Rx Rate: <strong className="text-cyan-400">{client.rxRate ? formatRate(client.rxRate * 125) : '1.2 Gbps'}</strong></div>
+              <div>RSSI: <strong className="text-slate-200">{typeof client.rssi === 'number' ? `${client.rssi} dBm` : MISSING_VALUE}</strong></div>
+              <div>SNR: <strong className="text-slate-200">{typeof client.snr === 'number' ? `${client.snr} dB` : MISSING_VALUE}</strong></div>
+              <div>PHY Tx Rate: <strong className="text-emerald-400">{formatLinkRateKbps(client.txRate)}</strong></div>
+              <div>PHY Rx Rate: <strong className="text-cyan-400">{formatLinkRateKbps(client.rxRate)}</strong></div>
             </div>
           </div>
         )}
 
-        {/* End-to-End Uplink Infrastructure Path */}
-        <div className="bg-slate-950/80 border border-slate-800/90 rounded-2xl p-4 space-y-2 font-mono text-xs">
-          <span className="text-purple-400 font-bold flex items-center gap-1.5">
-            <span>🗺️</span> End-to-End Uplink Infrastructure Path
-          </span>
-          <div className="flex flex-wrap items-center gap-2 pt-1 text-[11px]">
-            <span className="px-2.5 py-1 rounded-lg bg-slate-900 border border-slate-700 text-slate-200 font-bold">
-              {client.name || 'Client'}
+        {/* Uplink path, built only from the attachment point the controller reported */}
+        {uplinkHop && (
+          <div className="bg-slate-950/80 border border-slate-800/90 rounded-2xl p-4 space-y-2 font-mono text-xs">
+            <span className="text-purple-400 font-bold flex items-center gap-1.5">
+              <span>🗺️</span> Uplink Attachment Point
             </span>
-            <span className="text-cyan-400">➔</span>
-            <span className="px-2.5 py-1 rounded-lg bg-cyan-950 border border-cyan-800 text-cyan-300">
-              {client.apName ? `${client.apName} (SSID: ${client.ssid || 'Wi-Fi'})` : 'Core SG2218P Switch'}
-            </span>
-            <span className="text-cyan-400">➔</span>
-            <span className="px-2.5 py-1 rounded-lg bg-emerald-950 border border-emerald-800 text-emerald-300">
-              Backbone SG2218P Port {client.port || 9}
-            </span>
-            <span className="text-cyan-400">➔</span>
-            <span className="px-2.5 py-1 rounded-lg bg-purple-950 border border-purple-800 text-purple-300">
-              Gateway ER7206
-            </span>
+            <div className="flex flex-wrap items-center gap-2 pt-1 text-[11px]">
+              <span className="px-2.5 py-1 rounded-lg bg-slate-900 border border-slate-700 text-slate-200 font-bold">
+                {client.name || client.hostName || 'Client'}
+              </span>
+              <span className="text-cyan-400">➔</span>
+              <span
+                className={`px-2.5 py-1 rounded-lg border ${
+                  client.wireless
+                    ? 'bg-cyan-950 border-cyan-800 text-cyan-300'
+                    : 'bg-emerald-950 border-emerald-800 text-emerald-300'
+                }`}
+              >
+                {uplinkHop}
+              </span>
+            </div>
           </div>
-        </div>
+        )}
 
         {/* Bandwidth Throughput Totals */}
         <div className="grid grid-cols-3 gap-3 font-mono text-xs">

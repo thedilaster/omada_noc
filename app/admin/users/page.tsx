@@ -7,6 +7,7 @@ import ProfileWidget from '@/app/components/ProfileWidget';
 import InactivityTracker from '@/app/components/InactivityTracker';
 import { UserWithDetails, UserLoginRecord } from '@/types/auth';
 import { OmadaClientDevice } from '@/types/omada';
+import { normalizeMac } from '@/lib/omada/formatters';
 
 export default function AdminUsersPage() {
   const [activeTab, setActiveTab] = useState<'users' | 'logins'>('users');
@@ -718,7 +719,7 @@ export default function AdminUsersPage() {
                   <div className="max-h-48 overflow-y-auto border border-slate-800 rounded-xl divide-y divide-slate-800/60 bg-slate-950/60">
                     {discoveredDevices.map((dev) => {
                       const isAlreadyTagged = taggingUser.taggedDevices.some(
-                        (t) => t.macAddress.toUpperCase() === (dev.mac || '').toUpperCase()
+                        (t) => normalizeMac(t.macAddress) === normalizeMac(dev.mac)
                       );
                       const name = dev.name || dev.hostName || 'Unnamed Device';
                       return (

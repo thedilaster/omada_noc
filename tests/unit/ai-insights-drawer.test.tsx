@@ -1,7 +1,7 @@
 import React from 'react';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { AiInsightsDrawer } from '@/app/components/AiInsightsDrawer';
+import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { AiInsightsDrawer, mergeInsightHistory } from '@/app/components/AiInsightsDrawer';
 import { AiInsightRecord } from '@/types/reports';
 
 describe('AiInsightsDrawer Component', () => {
@@ -73,6 +73,10 @@ describe('AiInsightsDrawer Component', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it('renders nothing when isOpen is false', () => {
@@ -379,7 +383,8 @@ describe('AiInsightsDrawer Component', () => {
     fireEvent.change(noteInput, { target: { value: 'VLAN 20 is dedicated to smart home IoT devices.' } });
     const saveBtn = screen.getByRole('button', { name: 'Save' });
     fireEvent.click(saveBtn);
-    expect(screen.getByText(/Tuning Context Applied/i)).toBeInTheDocument();
+    expect(screen.getByText(/Note kept locally for this session only/i)).toBeInTheDocument();
+    expect(screen.queryByText(/Tuning Context Applied/i)).not.toBeInTheDocument();
 
     // Test form submit with empty value (does nothing)
     const form = saveBtn.closest('form')!;
@@ -437,13 +442,31 @@ describe('AiInsightsDrawer Component', () => {
     // Test Suppress button
     const suppressBtn = screen.getByRole('button', { name: /Suppress/i });
     fireEvent.click(suppressBtn);
-    expect(screen.getByText(/Rule tuned and suppressed for future audits/i)).toBeInTheDocument();
+    // Feedback is session-local only; the toast must not claim future audits are tuned
+    expect(screen.getByText(/Suppressed locally for this session only/i)).toBeInTheDocument();
+    expect(screen.queryByText(/suppressed for future audits/i)).not.toBeInTheDocument();
 
     // Switch to New tab and test Expected IoT button
     fireEvent.click(screen.getByRole('button', { name: /New \(1\)/i }));
     const expectedIotBtn = screen.getByRole('button', { name: /Expected IoT/i });
     fireEvent.click(expectedIotBtn);
     expect(screen.getByText(/✓ Tuned: EXPECTED_IOT/i)).toBeInTheDocument();
+  });
+
+  it('suppresses a new issue locally for the session', async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ success: true, history: mockHistory }),
+    });
+
+    render(<AiInsightsDrawer isOpen={true} onClose={vi.fn()} />);
+    await waitFor(() => {
+      expect(screen.getByText('Weak RSSI Device')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole('button', { name: /New \(1\)/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Suppress/i }));
+    expect(screen.getByText(/✓ Tuned: SUPPRESSED/i)).toBeInTheDocument();
+    expect(screen.getByText(/Suppressed locally for this session only/i)).toBeInTheDocument();
   });
 
   it('triggers and clears feedback toast timeout callbacks', async () => {
@@ -537,6 +560,107 @@ describe('AiInsightsDrawer Component', () => {
     await waitFor(() => {
       expect(screen.getByText(/DeepSeek-R1 Neural Agent completed real generative reasoning!/i)).toBeInTheDocument();
     });
+  });
+
+  const makeRecord = (id: string, createdAt: string, healthScore: number): AiInsightRecord => ({
+    ...mockHistory[0],
+    id,
+    createdAt,
+    healthScore,
+    executiveSummary: `Summary ${id}`,
+    narration: undefined,
+  });
+
+  it('mergeInsightHistory dedupes by id (first list wins) and sorts newest first', () => {
+    const older = makeRecord('a', '2026-08-01T00:00:00Z', 70);
+    const newer = makeRecord('b', '2026-08-02T00:00:00Z', 80);
+    const newerDuplicate = { ...newer, healthScore: 1 };
+    const invalidDate = makeRecord('c', 'not-a-date', 50);
+
+    const merged = mergeInsightHistory([older, newer], [newerDuplicate, invalidDate]);
+    expect(merged.map((r) => r.id)).toEqual(['b', 'a', 'c']);
+    expect(merged[0].healthScore).toBe(80);
+  });
+
+  it('keeps the newest audit as latest when a reopen fetch no longer includes an old local record', async () => {
+    const oldRecord = makeRecord('old', '2026-08-01T00:00:00Z', 41);
+    const newRecord = makeRecord('new', '2026-08-03T00:00:00Z', 88);
+
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ history: [oldRecord] }),
+    });
+    const { rerender } = render(<AiInsightsDrawer isOpen={true} onClose={vi.fn()} />);
+    await waitFor(() => {
+      expect(screen.getByText('Summary old')).toBeInTheDocument();
+    });
+
+    rerender(<AiInsightsDrawer isOpen={false} onClose={vi.fn()} />);
+
+    // Server's top-N window has moved on: only newer records are returned
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ history: [newRecord] }),
+    });
+    rerender(<AiInsightsDrawer isOpen={true} onClose={vi.fn()} />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Summary new')).toBeInTheDocument();
+    });
+    expect(screen.queryByText('Summary old')).not.toBeInTheDocument();
+    expect(screen.getByText(/PAST 2 AUDITS/i)).toBeInTheDocument();
+  });
+
+  it('clears a stale error and shows loading again when reopened', async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 503,
+      json: async () => ({ error: 'History store offline' }),
+    });
+    const { rerender } = render(<AiInsightsDrawer isOpen={true} onClose={vi.fn()} />);
+    await waitFor(() => {
+      expect(screen.getByText(/History store offline/i)).toBeInTheDocument();
+    });
+
+    rerender(<AiInsightsDrawer isOpen={false} onClose={vi.fn()} />);
+    global.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
+    rerender(<AiInsightsDrawer isOpen={true} onClose={vi.fn()} />);
+
+    expect(screen.queryByText(/History store offline/i)).not.toBeInTheDocument();
+    expect(screen.getByText(/Retrieving AI audit trajectory/i)).toBeInTheDocument();
+  });
+
+  it('auto-dismisses the background completion toast and clears its timer on close', async () => {
+    vi.useFakeTimers();
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ history: [] }),
+    });
+    const completed = {
+      status: 'completed' as const,
+      engineType: 'NLG_ALGORITHMIC' as const,
+      startTime: 1,
+      result: makeRecord('bg-done', '2026-08-04T00:00:00Z', 90),
+    };
+
+    const { rerender } = render(<AiInsightsDrawer isOpen={true} onClose={vi.fn()} backgroundAudit={completed} />);
+    expect(screen.getByText(/Deterministic NLG audit completed/i)).toBeInTheDocument();
+
+    // Closing before the timeout cancels it; reopening shows the toast again
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+    });
+    rerender(<AiInsightsDrawer isOpen={false} onClose={vi.fn()} backgroundAudit={completed} />);
+    await act(async () => {
+      vi.advanceTimersByTime(10000);
+    });
+    rerender(<AiInsightsDrawer isOpen={true} onClose={vi.fn()} backgroundAudit={completed} />);
+    expect(screen.getByText(/Deterministic NLG audit completed/i)).toBeInTheDocument();
+
+    await act(async () => {
+      vi.advanceTimersByTime(4000);
+    });
+    expect(screen.queryByText(/Deterministic NLG audit completed/i)).not.toBeInTheDocument();
   });
 
   it('calls onTriggerNlgAudit and onTriggerAgentAudit when provided as props', async () => {

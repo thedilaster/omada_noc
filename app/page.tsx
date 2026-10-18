@@ -1,9 +1,9 @@
 import { redirect } from 'next/navigation';
-import { cookies } from 'next/headers';
 import Dashboard from '@/app/components/Dashboard';
 import { getOmadaClient } from '@/lib/omada/client';
-import { getCurrentSession, SESSION_COOKIE_NAME } from '@/lib/auth/session';
-import { findUserById, getUserDeviceTags } from '@/lib/db/queries';
+import { getCurrentSession } from '@/lib/auth/session';
+import { scopeTelemetry } from '@/lib/auth/device-scope';
+import { findUserById } from '@/lib/db/queries';
 import { TelemetryResponse, OmadaClientDevice } from '@/types/omada';
 import { resolveClientVlan } from '@/lib/omada/formatters';
 
@@ -19,13 +19,9 @@ export default async function Page() {
   // Verify the user still exists in the database (handles DB recreation / orphaned JWTs)
   const dbUser = await findUserById(session.userId);
   if (!dbUser) {
-    try {
-      const cookieStore = await cookies();
-      cookieStore.delete(SESSION_COOKIE_NAME);
-    } catch {
-      // Ignore cookie clear error if headers were already sent
-    }
-    redirect('/login');
+    // Server Components can't clear cookies; the logout route clears it and redirects to /login
+    // (redirecting to /login directly loops, since the proxy bounces the still-valid JWT back here)
+    redirect('/api/auth/logout');
     return null;
   }
 
@@ -34,16 +30,16 @@ export default async function Page() {
   
   let clients: OmadaClientDevice[] = [];
   let topology = undefined;
-  let networks = undefined;
-  let ssids = undefined;
+  let netData = undefined;
+  let ssidData = undefined;
   let poeDevices = undefined;
   let devices = undefined;
-  let wanStatus = undefined;
-  let events = undefined;
+  let wanData = undefined;
+  let eventData = undefined;
 
   if (status.controllerOnline) {
     try {
-      const [rawClients, topoData, netData, ssidData, poeData, devData, wanData, eventData] = await Promise.all([
+      const [rawClients, topoData, nets, ssidList, poeData, devData, wan, evts] = await Promise.all([
         client.getActiveClients(),
         typeof client.getTopology === 'function' ? client.getTopology().catch(() => []) : Promise.resolve([]),
         typeof client.getLanNetworks === 'function' ? client.getLanNetworks().catch(() => []) : Promise.resolve([]),
@@ -56,61 +52,30 @@ export default async function Page() {
 
       clients = (rawClients || []).map((c) => ({
         ...c,
-        vlanId: resolveClientVlan(c, netData, ssidData),
+        vlanId: resolveClientVlan(c, nets, ssidList),
       }));
       topology = topoData;
+      netData = nets;
+      ssidData = ssidList;
       poeDevices = poeData;
       devices = devData;
-      wanStatus = wanData;
-      events = eventData;
-
-      if (netData && netData.length > 0) {
-        networks = netData.map((net) => ({
-          ...net,
-          clientCount: clients.filter((c) => c.vlanId === net.vlan).length,
-        }));
-      } else {
-        networks = netData;
-      }
-
-      if (ssidData && ssidData.length > 0) {
-        ssids = ssidData.map((s) => ({
-          ...s,
-          clientCount: clients.filter((c) => c.ssid?.toLowerCase() === s.name.toLowerCase()).length,
-        }));
-      } else {
-        ssids = ssidData;
-      }
+      wanData = wan;
+      eventData = evts;
     } catch (err) {
       console.error('Failed to load initial client list:', err);
     }
   }
 
-  // Device Tagging Matrix Scoping:
-  // If user is not ADMIN and has tagged devices, scope telemetry to those devices
-  let filteredClients = clients;
-  if (session.role !== 'ADMIN') {
-    try {
-      const userTags = await getUserDeviceTags(session.userId);
-      if (userTags && userTags.length > 0) {
-        const allowedMacs = new Set(userTags.map((t) => t.macAddress.toUpperCase()));
-        filteredClients = clients.filter((c) => allowedMacs.has(c.mac.toUpperCase()));
-
-        // Recalculate status KPI metrics to match the scoped subset
-        status.totalClients = filteredClients.length;
-        status.wirelessClients = filteredClients.filter((c) => c.wireless).length;
-        status.wiredClients = filteredClients.filter((c) => !c.wireless).length;
-        status.totalActivityRate = filteredClients.reduce((sum, c) => sum + (c.activity || 0), 0);
-        status.totalTrafficDown = filteredClients.reduce((sum, c) => sum + (c.trafficDown || 0), 0);
-        status.totalTrafficUp = filteredClients.reduce((sum, c) => sum + (c.trafficUp || 0), 0);
-      }
-    } catch (err) {
-      console.error('Error fetching user device tags for initial page render:', err);
-    }
-  }
+  // Device Tagging Matrix Scoping (shared with /api/telemetry), using the stored role rather than
+  // the JWT claim so a demoted admin is scoped immediately; fails closed if tag lookup errors
+  const { status: scopedStatus, clients: filteredClients, networks, ssids, wanStatus, events } =
+    await scopeTelemetry(
+      { userId: dbUser.id, role: dbUser.role },
+      { status, clients, networks: netData, ssids: ssidData, wanStatus: wanData, events: eventData }
+    );
 
   const initialData: TelemetryResponse = {
-    status,
+    status: scopedStatus,
     topClients: filteredClients.slice(0, 50),
     allClients: filteredClients,
     ...(topology && { topology }),

@@ -4,12 +4,44 @@ import { SessionPayload } from '@/types/auth';
 
 export const SESSION_COOKIE_NAME = 'noc_session';
 export const INACTIVITY_TIMEOUT_SECONDS = 15 * 60; // 15 minutes (900 seconds)
+// Minimum age of `lastActive` before the proxy re-signs a sliding session token
+export const SESSION_REFRESH_INTERVAL_MS = 60 * 1000;
 
-const SECRET_STRING =
-  process.env.JWT_SECRET || 'omada-noc-dashboard-super-secure-jwt-secret-key-32-chars';
+const MIN_SECRET_LENGTH = 32;
+const DEV_FALLBACK_SECRET = 'omada-noc-dashboard-super-secure-jwt-secret-key-32-chars';
 
+let warnedAboutFallbackSecret = false;
+
+function encodeSecret(secret: string): Uint8Array {
+  return Uint8Array.from(Buffer.from(secret, 'utf-8'));
+}
+
+/**
+ * Resolves the HS256 signing key lazily so a missing JWT_SECRET is caught at request time.
+ * Production refuses to run with a missing/short secret (the dev fallback is public and
+ * would let anyone forge an ADMIN token); dev/test fall back with a one-time warning.
+ */
 function getSecretKey(): Uint8Array {
-  return Uint8Array.from(Buffer.from(SECRET_STRING, 'utf-8'));
+  const secret = process.env.JWT_SECRET;
+
+  if (process.env.NODE_ENV === 'production') {
+    if (!secret || secret.length < MIN_SECRET_LENGTH) {
+      throw new Error(
+        `JWT_SECRET must be set to at least ${MIN_SECRET_LENGTH} characters in production.`
+      );
+    }
+    return encodeSecret(secret);
+  }
+
+  if (!secret) {
+    if (!warnedAboutFallbackSecret) {
+      warnedAboutFallbackSecret = true;
+      console.warn('⚠️ [Auth] JWT_SECRET is not set; using the insecure development fallback secret.');
+    }
+    return encodeSecret(DEV_FALLBACK_SECRET);
+  }
+
+  return encodeSecret(secret);
 }
 
 /**
@@ -69,4 +101,33 @@ export async function getCurrentSession(): Promise<SessionPayload | null> {
   } catch {
     return null;
   }
+}
+
+/**
+ * Decides whether the session cookie needs the Secure flag. COOKIE_SECURE ('true'/'false')
+ * wins when set; otherwise Secure is only used when the browser reached us over HTTPS
+ * (directly or via a TLS-terminating proxy), since browsers drop Secure cookies on plain
+ * http://<LAN-IP>:3000 and login would silently bounce back to /login.
+ */
+export function isSecureRequest(request: Request): boolean {
+  const override = process.env.COOKIE_SECURE?.trim().toLowerCase();
+  if (override === 'true') return true;
+  if (override === 'false') return false;
+
+  const forwardedProto = (request.headers.get('x-forwarded-proto') || '').split(',')[0].trim().toLowerCase();
+  return forwardedProto === 'https' || new URL(request.url).protocol === 'https:';
+}
+
+/**
+ * Shared Set-Cookie attributes for the session cookie (login, logout, and proxy refresh).
+ */
+export function sessionCookieOptions(request: Request, maxAge: number) {
+  return {
+    name: SESSION_COOKIE_NAME,
+    httpOnly: true,
+    secure: isSecureRequest(request),
+    sameSite: 'lax' as const,
+    path: '/',
+    maxAge,
+  };
 }

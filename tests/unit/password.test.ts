@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { hashPassword, verifyPassword } from '@/lib/auth/password';
+import { hashPassword, verifyPassword, verifyDummyPassword } from '@/lib/auth/password';
 
 describe('Password Security Module', () => {
   it('hashes a plaintext password and returns a valid bcrypt hash', async () => {
@@ -28,5 +28,10 @@ describe('Password Security Module', () => {
   it('handles empty or missing parameters gracefully', async () => {
     expect(await verifyPassword('', '')).toBe(false);
     expect(await verifyPassword('something', '')).toBe(false);
+  });
+
+  it('runs a dummy bcrypt comparison that never succeeds (login timing parity)', async () => {
+    expect(await verifyDummyPassword('AdminPass123!')).toBe(false);
+    expect(await verifyDummyPassword('')).toBe(false);
   });
 });

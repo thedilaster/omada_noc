@@ -9,7 +9,8 @@ export async function GET() {
       return NextResponse.json({ error: 'Unauthorized. Active session required.' }, { status: 401 });
     }
 
-    const report = await getReportSummary();
+    // Non-admins get a report scoped to their tagged devices, without operator/login audit data
+    const report = await getReportSummary(undefined, { userId: session.userId, role: session.role });
     return NextResponse.json({ success: true, report });
   } catch (error: unknown) {
     console.error('Reports summary API error:', error);

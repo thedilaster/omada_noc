@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as poolModule from '@/lib/db/pool';
 import {
   findUserByEmailOrUsername,
@@ -7,6 +7,7 @@ import {
   updateUserRole,
   updateUserPassword,
   deleteUser,
+  countAdmins,
   listAllUsersWithDetails,
   getUserProfile,
   upsertUserProfile,
@@ -20,6 +21,8 @@ import {
   getLatestAiInsight,
   resetDbFallbackForTests,
 } from '@/lib/db/queries';
+
+const UID = '11111111-2222-4333-8444-555555555555';
 
 describe('PostgreSQL Database Queries Repository', () => {
   const mockQuery = vi.fn();
@@ -38,26 +41,31 @@ describe('PostgreSQL Database Queries Repository', () => {
     } as any);
   });
 
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    resetDbFallbackForTests();
+  });
+
   describe('Error Handling', () => {
     it('rethrows non-connection errors across query functions', async () => {
       const syntaxError = new Error('syntax error at or near WHERE');
       mockQuery.mockRejectedValue(syntaxError);
 
       await expect(findUserByEmailOrUsername('admin')).rejects.toThrow('syntax error');
-      await expect(findUserById('u1')).rejects.toThrow('syntax error');
-      await expect(updateUserRole('u1', 'ADMIN')).rejects.toThrow('syntax error');
-      await expect(updateUserPassword('u1', 'pw')).rejects.toThrow('syntax error');
-      await expect(deleteUser('u1')).rejects.toThrow('syntax error');
+      await expect(findUserById(UID)).rejects.toThrow('syntax error');
+      await expect(updateUserRole(UID, 'ADMIN')).rejects.toThrow('syntax error');
+      await expect(updateUserPassword(UID, 'pw')).rejects.toThrow('syntax error');
+      await expect(deleteUser(UID)).rejects.toThrow('syntax error');
       await expect(listAllUsersWithDetails()).rejects.toThrow('syntax error');
-      await expect(getUserProfile('u1')).rejects.toThrow('syntax error');
-      await expect(upsertUserProfile('u1', { fullName: 'name' })).rejects.toThrow('syntax error');
-      await expect(getUserDeviceTags('u1')).rejects.toThrow('syntax error');
-      await expect(tagDeviceToUser('u1', 'AA:BB:CC:DD:EE:FF', 'label')).rejects.toThrow('syntax error');
-      await expect(removeDeviceTagFromUser('u1', 'AA:BB:CC:DD:EE:FF')).rejects.toThrow('syntax error');
+      await expect(getUserProfile(UID)).rejects.toThrow('syntax error');
+      await expect(upsertUserProfile(UID, { fullName: 'name' })).rejects.toThrow('syntax error');
+      await expect(getUserDeviceTags(UID)).rejects.toThrow('syntax error');
+      await expect(tagDeviceToUser(UID, 'AA:BB:CC:DD:EE:FF', 'label')).rejects.toThrow('syntax error');
+      await expect(removeDeviceTagFromUser(UID, 'AA:BB:CC:DD:EE:FF')).rejects.toThrow('syntax error');
       await expect(getPaginatedLogins(1, 10)).rejects.toThrow('syntax error');
       await expect(
         saveAiInsight({
-          triggeredByUserId: 'u1',
+          triggeredByUserId: UID,
           healthScore: 90,
           previousScore: null,
           scoreDelta: 0,
@@ -72,6 +80,98 @@ describe('PostgreSQL Database Queries Repository', () => {
       ).rejects.toThrow('syntax error');
       await expect(getRecentAiInsights(5)).rejects.toThrow('syntax error');
       await expect(getLatestAiInsight()).rejects.toThrow('syntax error');
+      await expect(countAdmins()).rejects.toThrow('syntax error');
+    });
+
+    it('rethrows connection errors instead of falling back to memory in production', async () => {
+      vi.stubEnv('NODE_ENV', 'production');
+      vi.stubEnv('ALLOW_MEMORY_FALLBACK', '');
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      const connErr = Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:5432'), { code: 'ECONNREFUSED' });
+      mockQuery.mockRejectedValue(connErr);
+
+      await expect(findUserByEmailOrUsername('admin@omadanoc.com')).rejects.toThrow('ECONNREFUSED');
+      await expect(findUserById(UID)).rejects.toThrow('ECONNREFUSED');
+      await expect(countAdmins()).rejects.toThrow('ECONNREFUSED');
+      expect(poolModule.isMemoryFallbackActive()).toBe(false);
+
+      // The audit write still never crashes the login flow
+      await expect(
+        recordLoginAttempt(null, 'admin@omadanoc.com', '127.0.0.1', 'UA', 'FAILED', 'x')
+      ).resolves.toBeUndefined();
+    });
+
+    it('switches to the memory store from every query catch block on connection errors in dev', async () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const connErr = Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:5432'), { code: 'ECONNREFUSED' });
+      mockQuery.mockRejectedValue(connErr);
+      const ADMIN_ID = '00000000-0000-0000-0000-000000000001';
+
+      // Reset before each call so every function takes its own catch -> fallback path
+      const viaCatch = async <T>(fn: () => Promise<T>): Promise<T> => {
+        resetDbFallbackForTests();
+        const result = await fn();
+        expect(poolModule.isMemoryFallbackActive()).toBe(true);
+        return result;
+      };
+
+      expect((await viaCatch(() => findUserById(ADMIN_ID)))?.role).toBe('ADMIN');
+      expect((await viaCatch(() => findUserByEmailOrUsername('admin')))?.id).toBe(ADMIN_ID);
+      expect(await viaCatch(() => updateUserRole(ADMIN_ID, 'ADMIN'))).not.toBeNull();
+      expect(await viaCatch(() => updateUserPassword(UID, 'hash'))).toBe(false);
+      expect(await viaCatch(() => deleteUser(UID))).toBe(false);
+      expect((await viaCatch(() => listAllUsersWithDetails())).length).toBeGreaterThanOrEqual(1);
+      expect(await viaCatch(() => getUserProfile(ADMIN_ID))).not.toBeNull();
+      expect((await viaCatch(() => upsertUserProfile(ADMIN_ID, { department: 'NOC' }))).department).toBe('NOC');
+      expect((await viaCatch(() => tagDeviceToUser(ADMIN_ID, '02:00:00:00:00:01'))).macAddress).toBe('02-00-00-00-00-01');
+      expect(await viaCatch(() => getUserDeviceTags(ADMIN_ID))).toHaveLength(1);
+      expect(await viaCatch(() => removeDeviceTagFromUser(ADMIN_ID, '02-00-00-00-00-01'))).toBe(true);
+      await viaCatch(() => recordLoginAttempt(null, 'x@test.com', '127.0.0.1', 'UA', 'FAILED', 'x'));
+      expect((await viaCatch(() => getPaginatedLogins(1, 10))).total).toBeGreaterThanOrEqual(1);
+      const insight = await viaCatch(() =>
+        saveAiInsight({
+          triggeredByUserId: ADMIN_ID,
+          healthScore: 77,
+          previousScore: null,
+          scoreDelta: 0,
+          trendDirection: 'INITIAL',
+          executiveSummary: 'catch path',
+          resolvedIssues: [],
+          persistingIssues: [],
+          newIssues: [],
+          actionableSuggestions: [],
+          metricsSnapshot: {},
+        })
+      );
+      expect((await viaCatch(() => getRecentAiInsights(1)))[0].id).toBe(insight.id);
+      expect((await viaCatch(() => getLatestAiInsight()))?.id).toBe(insight.id);
+
+      // createUser fails at pool.connect()
+      vi.spyOn(poolModule, 'getDbPool').mockReturnValue({
+        query: mockQuery,
+        connect: async () => {
+          throw connErr;
+        },
+      } as any);
+      const created = await viaCatch(() => createUser('catchuser', 'catch@test.com', 'hash'));
+      expect(created.username).toBe('catchuser');
+    });
+
+    it('honours ALLOW_MEMORY_FALLBACK in both directions', async () => {
+      const connErr = Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:5432'), { code: 'ECONNREFUSED' });
+      mockQuery.mockRejectedValue(connErr);
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      vi.stubEnv('ALLOW_MEMORY_FALLBACK', 'false');
+      await expect(findUserByEmailOrUsername('admin')).rejects.toThrow('ECONNREFUSED');
+
+      vi.stubEnv('NODE_ENV', 'production');
+      vi.stubEnv('ALLOW_MEMORY_FALLBACK', 'true');
+      const admin = await findUserByEmailOrUsername('admin');
+      expect(admin?.role).toBe('ADMIN');
+      expect(poolModule.isMemoryFallbackActive()).toBe(true);
+      expect(await countAdmins()).toBeGreaterThanOrEqual(1);
     });
   });
 
@@ -103,11 +203,34 @@ describe('PostgreSQL Database Queries Repository', () => {
 
     it('findUserById returns user or null', async () => {
       mockQuery.mockResolvedValueOnce({
-        rows: [{ id: 'uuid-1', username: 'admin', email: 'admin@omada.com', role: 'ADMIN' }],
+        rows: [{ id: UID, username: 'admin', email: 'admin@omada.com', role: 'ADMIN' }],
       });
 
-      const user = await findUserById('uuid-1');
-      expect(user?.id).toBe('uuid-1');
+      const user = await findUserById(UID);
+      expect(user?.id).toBe(UID);
+
+      mockQuery.mockResolvedValueOnce({ rows: [] });
+      expect(await findUserById(UID)).toBeNull();
+    });
+
+    it('short-circuits malformed (non-UUID) ids without querying Postgres', async () => {
+      expect(await findUserById('not-a-uuid')).toBeNull();
+      expect(await updateUserRole('1', 'ADMIN')).toBeNull();
+      expect(await updateUserPassword("1' OR '1'='1", 'hash')).toBe(false);
+      expect(await deleteUser('')).toBe(false);
+      expect(await getUserProfile('abc')).toBeNull();
+      expect(await getUserDeviceTags('abc')).toEqual([]);
+      expect(await removeDeviceTagFromUser('abc', 'AA-BB-CC-DD-EE-FF')).toBe(false);
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    it('countAdmins counts ADMIN accounts', async () => {
+      mockQuery.mockResolvedValueOnce({ rows: [{ count: '2' }] });
+      expect(await countAdmins()).toBe(2);
+      expect(mockQuery.mock.calls[0][0]).toContain("role = 'ADMIN'");
+
+      mockQuery.mockResolvedValueOnce({ rows: [] });
+      expect(await countAdmins()).toBe(0);
     });
 
     it('createUser creates user and default profile inside transaction', async () => {
@@ -141,22 +264,22 @@ describe('PostgreSQL Database Queries Repository', () => {
 
     it('updateUserRole updates role', async () => {
       mockQuery.mockResolvedValueOnce({
-        rows: [{ id: 'uuid-1', role: 'ADMIN' }],
+        rows: [{ id: UID, role: 'ADMIN' }],
       });
 
-      const res = await updateUserRole('uuid-1', 'ADMIN');
+      const res = await updateUserRole(UID, 'ADMIN');
       expect(res?.role).toBe('ADMIN');
     });
 
     it('updateUserPassword updates password hash', async () => {
       mockQuery.mockResolvedValueOnce({ rowCount: 1 });
-      const success = await updateUserPassword('uuid-1', 'newhash');
+      const success = await updateUserPassword(UID, 'newhash');
       expect(success).toBe(true);
     });
 
     it('deleteUser deletes user', async () => {
       mockQuery.mockResolvedValueOnce({ rowCount: 1 });
-      const success = await deleteUser('uuid-1');
+      const success = await deleteUser(UID);
       expect(success).toBe(true);
     });
 
@@ -197,7 +320,7 @@ describe('PostgreSQL Database Queries Repository', () => {
         rows: [{ id: 'p1', userId: 'u1', fullName: 'Jane Doe', theme: 'dark' }],
       });
 
-      const profile = await getUserProfile('u1');
+      const profile = await getUserProfile(UID);
       expect(profile?.fullName).toBe('Jane Doe');
     });
 
@@ -206,8 +329,15 @@ describe('PostgreSQL Database Queries Repository', () => {
         rows: [{ id: 'p1', userId: 'u1', fullName: 'Updated Name', theme: 'dark' }],
       });
 
-      const profile = await upsertUserProfile('u1', { fullName: 'Updated Name' });
+      const profile = await upsertUserProfile(UID, { fullName: 'Updated Name' });
       expect(profile.fullName).toBe('Updated Name');
+
+      // Partial updates must keep omitted columns: DO UPDATE uses the raw params, not EXCLUDED
+      const [sql, params] = mockQuery.mock.calls[0];
+      expect(sql).toContain('full_name = COALESCE($2, user_profiles.full_name)');
+      expect(sql).toContain('theme = COALESCE($6, user_profiles.theme)');
+      expect(sql).not.toContain('COALESCE(EXCLUDED.');
+      expect(params).toEqual([UID, 'Updated Name', null, null, null, null]);
     });
   });
 
@@ -217,23 +347,31 @@ describe('PostgreSQL Database Queries Repository', () => {
         rows: [{ id: 't1', userId: 'u1', macAddress: 'AA:BB:CC:DD:EE:FF' }],
       });
 
-      const tags = await getUserDeviceTags('u1');
+      const tags = await getUserDeviceTags(UID);
       expect(tags).toHaveLength(1);
     });
 
-    it('tagDeviceToUser normalizes MAC and inserts tag', async () => {
+    it('tagDeviceToUser stores the MAC canonically and inserts tag', async () => {
       mockQuery.mockResolvedValueOnce({
-        rows: [{ id: 't1', userId: 'u1', macAddress: 'AA:BB:CC:DD:EE:FF', deviceName: 'My iPad' }],
+        rows: [{ id: 't1', userId: UID, macAddress: 'AA-BB-CC-DD-EE-FF', deviceName: 'My iPad' }],
       });
 
-      const tag = await tagDeviceToUser('u1', 'aa:bb:cc:dd:ee:ff', 'My iPad');
-      expect(tag.macAddress).toBe('AA:BB:CC:DD:EE:FF');
+      const tag = await tagDeviceToUser(UID, ' aa:bb:cc:dd:ee:ff ', 'My iPad');
+      expect(tag.macAddress).toBe('AA-BB-CC-DD-EE-FF');
+      expect(mockQuery.mock.calls[0][1]).toEqual([UID, 'AA-BB-CC-DD-EE-FF', 'My iPad']);
     });
 
-    it('removeDeviceTagFromUser deletes tag by user and MAC', async () => {
+    it('tagDeviceToUser rejects MACs that are not 12 hex digits', async () => {
+      await expect(tagDeviceToUser(UID, 'AA:BB', 'x')).rejects.toThrow('Invalid MAC address');
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    it('removeDeviceTagFromUser deletes tag by user and separator-insensitive MAC', async () => {
       mockQuery.mockResolvedValueOnce({ rowCount: 1 });
-      const success = await removeDeviceTagFromUser('u1', 'aa:bb:cc:dd:ee:ff');
+      const success = await removeDeviceTagFromUser(UID, 'aa:bb:cc:dd:ee:ff');
       expect(success).toBe(true);
+      expect(mockQuery.mock.calls[0][0]).toContain("REGEXP_REPLACE(mac_address, '[^a-fA-F0-9]', '', 'g')");
+      expect(mockQuery.mock.calls[0][1]).toEqual([UID, 'AABBCCDDEEFF']);
     });
   });
 
@@ -343,6 +481,11 @@ describe('PostgreSQL Database Queries Repository', () => {
         code: 'ECONNREFUSED',
       });
       mockQuery.mockRejectedValue(connErr);
+
+      // countAdmins switches to memory from its own catch block
+      expect(await countAdmins()).toBeGreaterThanOrEqual(1);
+      expect(poolModule.isMemoryFallbackActive()).toBe(true);
+      resetDbFallbackForTests();
 
       const saved = await saveAiInsight({
         triggeredByUserId: 'u-mem-1',

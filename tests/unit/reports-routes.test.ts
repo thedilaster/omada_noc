@@ -44,6 +44,34 @@ describe('Reports API Route (/api/reports/summary)', () => {
     const json = await res.json();
     expect(json.success).toBe(true);
     expect(json.report.siteName).toBe('The Farm');
+    expect(aggregationModule.getReportSummary).toHaveBeenCalledWith(undefined, { userId: 'u-1', role: 'ADMIN' });
+  });
+
+  it('passes the non-admin session through so the report is scoped', async () => {
+    vi.spyOn(sessionModule, 'getCurrentSession').mockResolvedValue({
+      userId: 'u-7',
+      username: 'viewer',
+      email: 'viewer@omadanoc.com',
+      role: 'USER',
+      lastActive: Date.now(),
+    });
+    const summarySpy = vi.spyOn(aggregationModule, 'getReportSummary').mockResolvedValue({
+      generatedAt: '2026-08-28T12:00:00Z',
+      siteName: 'Site',
+      controllerUptime: 'Unknown',
+      networkHealthScore: 100,
+      infrastructure: {} as any,
+      topActiveDevices: [],
+      topVolumeDevices: [],
+      topActiveUsers: [],
+      rfDistribution: {} as any,
+    });
+
+    const res = await reportsSummaryHandler();
+    expect(res.status).toBe(200);
+    expect(summarySpy).toHaveBeenCalledWith(undefined, { userId: 'u-7', role: 'USER' });
+    const json = await res.json();
+    expect(json.report.securitySummary).toBeUndefined();
   });
 
   it('handles unexpected exceptions and returns 500', async () => {

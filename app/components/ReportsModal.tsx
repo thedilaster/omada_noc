@@ -16,6 +16,16 @@ export function ReportsModal({ isOpen, onClose }: ReportsModalProps) {
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'devices' | 'volume' | 'users' | 'rf'>('devices');
 
+  // Reset transient fetch state whenever the modal is reopened (adjusting state on prop change)
+  const [wasOpen, setWasOpen] = useState<boolean>(isOpen);
+  if (wasOpen !== isOpen) {
+    setWasOpen(isOpen);
+    if (isOpen) {
+      setLoading(true);
+      setError(null);
+    }
+  }
+
   useEffect(() => {
     if (!isOpen) return;
 
@@ -370,26 +380,32 @@ export function ReportsModal({ isOpen, onClose }: ReportsModalProps) {
               {/* Tab 4: Top Operators & Security */}
               {activeTab === 'users' && (
                 <div className="space-y-4">
-                  <div className="grid grid-cols-3 gap-3">
-                    <div className="p-3.5 rounded-xl bg-slate-950/70 border border-slate-800">
-                      <div className="text-[11px] font-semibold text-slate-400">24h Auth Success Rate</div>
-                      <div className="text-xl font-bold text-emerald-400 font-mono mt-1">
-                        {report.securitySummary.authSuccessRate24h}%
+                  {!report.securitySummary ? (
+                    <div className="p-4 rounded-xl bg-slate-950/70 border border-slate-800 text-xs text-slate-400 font-mono">
+                      🔒 Operator and authentication audit data is only available to administrators.
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-3 gap-3">
+                      <div className="p-3.5 rounded-xl bg-slate-950/70 border border-slate-800">
+                        <div className="text-[11px] font-semibold text-slate-400">24h Auth Success Rate</div>
+                        <div className="text-xl font-bold text-emerald-400 font-mono mt-1">
+                          {report.securitySummary.authSuccessRate24h}%
+                        </div>
+                      </div>
+                      <div className="p-3.5 rounded-xl bg-slate-950/70 border border-slate-800">
+                        <div className="text-[11px] font-semibold text-slate-400">Total Auth Events (24h)</div>
+                        <div className="text-xl font-bold text-slate-100 font-mono mt-1">
+                          {report.securitySummary.totalLogins24h}
+                        </div>
+                      </div>
+                      <div className="p-3.5 rounded-xl bg-slate-950/70 border border-slate-800">
+                        <div className="text-[11px] font-semibold text-slate-400">Registered Operators</div>
+                        <div className="text-xl font-bold text-cyan-400 font-mono mt-1">
+                          {report.securitySummary.activeUsersCount}
+                        </div>
                       </div>
                     </div>
-                    <div className="p-3.5 rounded-xl bg-slate-950/70 border border-slate-800">
-                      <div className="text-[11px] font-semibold text-slate-400">Total Auth Events (24h)</div>
-                      <div className="text-xl font-bold text-slate-100 font-mono mt-1">
-                        {report.securitySummary.totalLogins24h}
-                      </div>
-                    </div>
-                    <div className="p-3.5 rounded-xl bg-slate-950/70 border border-slate-800">
-                      <div className="text-[11px] font-semibold text-slate-400">Registered Operators</div>
-                      <div className="text-xl font-bold text-cyan-400 font-mono mt-1">
-                        {report.securitySummary.activeUsersCount}
-                      </div>
-                    </div>
-                  </div>
+                  )}
 
                   <div className="rounded-xl border border-slate-800 overflow-hidden bg-slate-950/40">
                     <table className="w-full text-left text-xs">

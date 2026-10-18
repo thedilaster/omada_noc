@@ -1,19 +1,13 @@
 import { NextResponse } from 'next/server';
-import { getCurrentSession } from '@/lib/auth/session';
+import { requireAdmin } from '@/lib/auth/guards';
 import { runDeepSeekAgentInsight } from '@/lib/ai/insights';
 
 export async function POST() {
   try {
-    const session = await getCurrentSession();
-    if (!session) {
-      return NextResponse.json({ error: 'Unauthorized. Active session required.' }, { status: 401 });
-    }
+    const guard = await requireAdmin();
+    if (!guard.ok) return guard.response;
 
-    if (session.role !== 'ADMIN') {
-      return NextResponse.json({ error: 'Forbidden. Administrator privileges required.' }, { status: 403 });
-    }
-
-    const insight = await runDeepSeekAgentInsight(session.userId);
+    const insight = await runDeepSeekAgentInsight(guard.session.userId);
     return NextResponse.json({ success: true, insight });
   } catch (error: unknown) {
     console.error('Run DeepSeek Agent insight error:', error);

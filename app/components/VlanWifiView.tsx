@@ -77,13 +77,20 @@ export default function VlanWifiView({
                 <p className="text-xs text-slate-400 font-mono mt-1">Gateway: <strong className="text-slate-200">{net.gatewaySubnet}</strong></p>
 
                 <div className="mt-4 pt-3 border-t border-slate-800/80 text-xs font-mono space-y-1.5 text-slate-400">
-                  <div className="flex justify-between">
-                    <span>DHCP Range:</span>
-                    <span className="text-slate-200">
-                      {net.ipaddrStart && net.ipaddrEnd
-                        ? `${net.ipaddrStart.split('.').slice(2).join('.')} - ${net.ipaddrEnd.split('.').slice(3).join('.')}`
-                        : 'Enabled'}
-                    </span>
+                  <div className="flex justify-between gap-2">
+                    <span className="shrink-0">DHCP Range:</span>
+                    {net.dhcpEnable ? (
+                      <span
+                        className="text-slate-200 truncate"
+                        title={net.ipaddrStart && net.ipaddrEnd ? `${net.ipaddrStart} - ${net.ipaddrEnd}` : undefined}
+                      >
+                        {net.ipaddrStart && net.ipaddrEnd
+                          ? `${net.ipaddrStart} - ${net.ipaddrEnd}`
+                          : 'Enabled'}
+                      </span>
+                    ) : (
+                      <span className="text-amber-300">Disabled</span>
+                    )}
                   </div>
                   {net.domain && (
                     <div className="flex justify-between">

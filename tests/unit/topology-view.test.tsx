@@ -74,6 +74,49 @@ describe('TopologyView Component', () => {
     expect(screen.getByText(/Custom NAS Server/i)).toBeInTheDocument();
   });
 
+  it('derives node status badges from status / statusCategory instead of always showing Online', () => {
+    const devices = [
+      { mac: '00:11', name: 'Gateway ER7206', type: 'gateway', model: 'ER7206', ip: '192.168.1.1', status: 14 },
+      { mac: '00:22', name: 'Dead Switch', type: 'switch', model: 'SG2218P', ip: '192.168.1.2', status: 0 },
+      { mac: '00:33', name: 'Mesh AP', type: 'ap', model: 'EAP670', ip: '192.168.1.3', status: 0, statusCategory: 1 },
+    ];
+
+    render(<TopologyView devices={devices as any} />);
+    expect(screen.getAllByText('Online')).toHaveLength(2);
+    expect(screen.getAllByText('Offline')).toHaveLength(1);
+  });
+
+  it('shows Unknown status and does not crash for custom nodes without a type or status', () => {
+    const customTopology = [
+      { name: 'Mystery Node', mac: 'AA-BB-CC-DD-EE-77', model: 'Unknown Model' },
+      { type: 'server', name: 'Offline NAS', mac: 'AA-BB-CC-DD-EE-78', model: 'DS920+', status: 0 },
+    ] as unknown as OmadaTopologyNode[];
+
+    render(<TopologyView topology={customTopology} />);
+    expect(screen.getByText('Mystery Node')).toBeInTheDocument();
+    expect(screen.getByText('unknown')).toBeInTheDocument();
+    expect(screen.getByText('Unknown')).toBeInTheDocument();
+    expect(screen.getByText('Offline')).toBeInTheDocument();
+    expect(screen.queryByText('Online')).not.toBeInTheDocument();
+  });
+
+  it('renders edge switches in the distribution tier with PoE allocation from device data', () => {
+    const devices = [
+      { mac: '00:11', name: 'Gateway', type: 'gateway', model: 'ER7206', ip: '192.168.1.1', status: 14 },
+      { mac: '00:22', name: 'Core Switch', type: 'switch', model: 'SG3428', ip: '192.168.1.2', status: 14, totalPoePower: 100, poeRemain: 60 },
+      { mac: '00:44', name: 'Barn Switch', type: 'switch', model: 'SG2210MP', ip: '192.168.1.4', status: 14 },
+      { mac: '00:33', name: 'Barn AP', type: 'ap', model: 'EAP610', ip: '192.168.1.3', status: 14, clientNum: 4 },
+    ];
+
+    render(<TopologyView devices={devices as any} />);
+    expect(screen.getByText(/Tier 3: Distribution & Outbuilding PoE Switches \(1 Managed Nodes\)/i)).toBeInTheDocument();
+    expect(screen.getByText('Barn Switch')).toBeInTheDocument();
+    expect(screen.getByText(/802.3at PoE Power & Data Feeds/i)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText('Core Switch'));
+    expect(screen.getByText('40.0W')).toBeInTheDocument();
+  });
+
   it('filters nodes by layer buttons (gateway, switch, ap, all)', () => {
     const devices = [
       { mac: '00:11', name: 'Gateway ER7206', type: 'gateway', model: 'ER7206', ip: '192.168.1.1', status: 14 },

@@ -1,16 +1,20 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { NextRequest } from 'next/server';
 import { proxy } from '@/proxy';
 import * as sessionModule from '@/lib/auth/session';
 
 describe('Next.js Edge Middleware Protection', () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    vi.restoreAllMocks();
   });
 
-  const createRequest = (path: string, cookieValue?: string) => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  const createRequest = (path: string, cookieValue?: string, headers: Record<string, string> = {}) => {
     const url = new URL(`http://localhost:3000${path}`);
-    const req = new NextRequest(url);
+    const req = new NextRequest(url, { headers });
     if (cookieValue) {
       req.cookies.set('noc_session', cookieValue);
     }
@@ -126,5 +130,66 @@ describe('Next.js Edge Middleware Protection', () => {
 
     const req3 = createRequest('/api/admin/users', 'admin-token');
     expect((await proxy(req3)).status).toBe(200);
+  });
+
+  it('clears an expired session cookie when redirecting to /login', async () => {
+    vi.spyOn(sessionModule, 'verifySessionToken').mockResolvedValue(null);
+    const res = await proxy(createRequest('/', 'expired-token'));
+    expect(res.status).toBe(307);
+    const cleared = res.cookies.get('noc_session');
+    expect(cleared?.value).toBe('');
+    expect(cleared?.maxAge).toBe(0);
+  });
+
+  describe('Sliding session refresh', () => {
+    const basePayload = {
+      userId: 'u-active',
+      username: 'active',
+      email: 'active@test.com',
+      role: 'USER' as const,
+      fullName: 'Active User',
+    };
+
+    it('re-signs the session cookie when lastActive is older than the refresh interval', async () => {
+      vi.stubEnv('COOKIE_SECURE', '');
+      const staleToken = await sessionModule.createSessionToken(basePayload, Date.now() - 5 * 60 * 1000);
+
+      const res = await proxy(createRequest('/api/telemetry', staleToken));
+      expect(res.status).toBe(200);
+
+      const refreshed = res.cookies.get('noc_session');
+      expect(refreshed).toBeDefined();
+      expect(refreshed!.value).not.toBe(staleToken);
+      expect(refreshed!.maxAge).toBe(sessionModule.INACTIVITY_TIMEOUT_SECONDS);
+      expect(refreshed!.httpOnly).toBe(true);
+      expect(refreshed!.secure).toBe(false);
+
+      const decoded = await sessionModule.verifySessionToken(refreshed!.value);
+      expect(decoded).toMatchObject(basePayload);
+      expect(Date.now() - decoded!.lastActive).toBeLessThan(5000);
+    });
+
+    it('does not re-sign a freshly issued session', async () => {
+      const freshToken = await sessionModule.createSessionToken(basePayload);
+      const res = await proxy(createRequest('/', freshToken));
+      expect(res.status).toBe(200);
+      expect(res.cookies.get('noc_session')).toBeUndefined();
+    });
+
+    it('marks the refreshed cookie Secure behind an HTTPS reverse proxy', async () => {
+      vi.stubEnv('COOKIE_SECURE', '');
+      const staleToken = await sessionModule.createSessionToken(basePayload, Date.now() - 2 * 60 * 1000);
+      const res = await proxy(createRequest('/', staleToken, { 'x-forwarded-proto': 'https' }));
+      expect(res.cookies.get('noc_session')?.secure).toBe(true);
+    });
+
+    it('treats a token without lastActive as stale and refreshes it', async () => {
+      vi.spyOn(sessionModule, 'verifySessionToken').mockResolvedValue({
+        ...basePayload,
+        lastActive: undefined as unknown as number,
+      });
+      const res = await proxy(createRequest('/', 'legacy-token'));
+      expect(res.cookies.get('noc_session')?.value).toBeTruthy();
+    });
   });
 });

@@ -4,6 +4,9 @@ import {
   formatRate,
   formatUptime,
   formatMac,
+  normalizeMac,
+  isDeviceOnline,
+  getSignalBand,
   resolveClientVlan,
 } from '@/lib/omada/formatters';
 
@@ -27,6 +30,11 @@ describe('formatters', () => {
       expect(formatBytes(1125899906842624 * 1024)).toBe('1024 PB'); // Clamps to largest unit
     });
 
+    it('keeps sub-1 values in the base unit instead of an undefined unit', () => {
+      expect(formatBytes(0.5)).toBe('0.5 B');
+      expect(formatBytes(-0.25)).toBe('-0.25 B');
+    });
+
     it('handles custom decimal places and negative decimal edge case', () => {
       expect(formatBytes(1536, 0)).toBe('2 KB');
       expect(formatBytes(1536, 3)).toBe('1.5 KB');
@@ -40,6 +48,11 @@ describe('formatters', () => {
       expect(formatRate(null)).toBe('0 B/s');
       expect(formatRate(NaN)).toBe('0 B/s');
       expect(formatRate(0)).toBe('0 B/s');
+    });
+
+    it('keeps sub-1 rates in B/s instead of an undefined unit', () => {
+      expect(formatRate(0.5)).toBe('0.5 B/s');
+      expect(formatRate(0.04)).toBe('0 B/s');
     });
 
     it('formats rates across units with default and custom decimals', () => {
@@ -79,6 +92,50 @@ describe('formatters', () => {
     it('formats days and hours', () => {
       expect(formatUptime(90000)).toBe('1d 1h');
       expect(formatUptime(172800)).toBe('2d');
+    });
+  });
+
+  describe('isDeviceOnline', () => {
+    it('prefers statusCategory and falls back to v5 connected codes 14-17', () => {
+      expect(isDeviceOnline({ status: 0, statusCategory: 1 })).toBe(true);
+      expect(isDeviceOnline({ status: 14, statusCategory: 0 })).toBe(false);
+      expect(isDeviceOnline({ status: 14 })).toBe(true);
+      expect(isDeviceOnline({ status: 17 })).toBe(true);
+      expect(isDeviceOnline({ status: 1 })).toBe(false);
+      expect(isDeviceOnline({ status: 30 })).toBe(false);
+      expect(isDeviceOnline({})).toBe(false);
+      expect(isDeviceOnline(null)).toBe(false);
+    });
+  });
+
+  describe('getSignalBand', () => {
+    it('bands RSSI in dBm', () => {
+      expect(getSignalBand({ rssi: -55 })).toBe('excellent');
+      expect(getSignalBand({ rssi: -60 })).toBe('good');
+      expect(getSignalBand({ rssi: -75 })).toBe('fair');
+      expect(getSignalBand({ rssi: -81 })).toBe('poor');
+    });
+
+    it('bands signalLevel percentage separately when RSSI is missing', () => {
+      expect(getSignalBand({ signalLevel: 90 })).toBe('excellent');
+      expect(getSignalBand({ signalLevel: 60 })).toBe('good');
+      expect(getSignalBand({ signalLevel: 30 })).toBe('fair');
+      expect(getSignalBand({ signalLevel: 10 })).toBe('poor');
+      // RSSI wins when both are present
+      expect(getSignalBand({ rssi: -85, signalLevel: 90 })).toBe('poor');
+    });
+
+    it('returns null when no signal data is reported', () => {
+      expect(getSignalBand({})).toBeNull();
+    });
+  });
+
+  describe('normalizeMac', () => {
+    it('strips separators and uppercases so Omada and user formats match', () => {
+      expect(normalizeMac('30-68-93-e8-29-54')).toBe('306893E82954');
+      expect(normalizeMac('30:68:93:E8:29:54')).toBe('306893E82954');
+      expect(normalizeMac(undefined)).toBe('');
+      expect(normalizeMac(null)).toBe('');
     });
   });
 

@@ -119,4 +119,42 @@ describe('PDF Generation Engine (lib/reports/pdf.ts)', () => {
     const docRose = generateNocPdfReport(roseData);
     expect(docRose).toBeDefined();
   });
+
+  it('skips the operator/security section for scoped (non-admin) reports and labels the footer as a Report ID', () => {
+    const scopedData: ReportSummaryData = {
+      generatedAt: '2026-08-28T12:00:00Z',
+      siteName: 'Scoped Site',
+      controllerUptime: 'Unknown',
+      networkHealthScore: 100,
+      infrastructure: {
+        totalAps: 0,
+        totalSwitches: 0,
+        totalGateways: 0,
+        totalClients: 0,
+        wirelessClients: 0,
+        wiredClients: 0,
+        freq2gClients: 0,
+        freq5gClients: 0,
+        aggregateThroughputMbps: 0,
+        totalSessionTrafficGb: 0,
+      },
+      topActiveDevices: [],
+      topVolumeDevices: [],
+      topActiveUsers: [],
+      rfDistribution: { excellent: 0, good: 0, fair: 0, poor: 0, totalWireless: 0 },
+    };
+
+    const doc = generateNocPdfReport(scopedData);
+    const pdfSource = doc.output();
+    expect(pdfSource).not.toContain('Multi-Tenant Scoping');
+    expect(pdfSource).not.toContain('No user accounts registered');
+    expect(pdfSource).toContain('Report ID:');
+    expect(pdfSource).not.toContain('SHA256');
+
+    const adminDoc = generateNocPdfReport({
+      ...scopedData,
+      securitySummary: { authSuccessRate24h: 100, totalLogins24h: 0, failedLogins24h: 0, activeUsersCount: 0 },
+    });
+    expect(adminDoc.output()).toContain('Multi-Tenant Scoping');
+  });
 });

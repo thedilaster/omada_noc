@@ -1,17 +1,18 @@
 import { NextResponse } from 'next/server';
-import { getCurrentSession } from '@/lib/auth/session';
+import { requireAdmin } from '@/lib/auth/guards';
 import { getPaginatedLogins } from '@/lib/db/queries';
+import { parseBoundedInt } from '@/lib/db/validation';
+
+const MAX_PAGE_SIZE = 100;
 
 export async function GET(request: Request) {
   try {
-    const session = await getCurrentSession();
-    if (!session || session.role !== 'ADMIN') {
-      return NextResponse.json({ error: 'Forbidden: Admin access required' }, { status: 403 });
-    }
+    const guard = await requireAdmin();
+    if (!guard.ok) return guard.response;
 
     const { searchParams } = new URL(request.url);
-    const page = Math.max(1, parseInt(searchParams.get('page') || '1', 10));
-    const pageSize = Math.max(1, parseInt(searchParams.get('pageSize') || '10', 10));
+    const page = parseBoundedInt(searchParams.get('page'), 1, 1, Number.MAX_SAFE_INTEGER);
+    const pageSize = parseBoundedInt(searchParams.get('pageSize'), 10, 1, MAX_PAGE_SIZE);
 
     const result = await getPaginatedLogins(page, pageSize);
     return NextResponse.json(result);

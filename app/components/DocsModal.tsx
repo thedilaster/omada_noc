@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect, useMemo } from 'react';
 import { DocItem } from '@/types/docs';
+import { copyText } from './uiHelpers';
 
 interface DocsModalProps {
   isOpen: boolean;
@@ -14,8 +15,19 @@ export function DocsModal({ isOpen, onClose }: DocsModalProps) {
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
-  const [copied, setCopied] = useState<boolean>(false);
+  const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'failed'>('idle');
 
+  // Reset transient fetch state whenever the modal is reopened (adjusting state on prop change)
+  const [wasOpen, setWasOpen] = useState<boolean>(isOpen);
+  if (wasOpen !== isOpen) {
+    setWasOpen(isOpen);
+    if (isOpen) {
+      setLoading(true);
+      setError(null);
+    }
+  }
+
+  // Fetch the document list once per open; selecting a doc in the sidebar must not refetch
   useEffect(() => {
     if (!isOpen) return;
 
@@ -31,8 +43,10 @@ export function DocsModal({ isOpen, onClose }: DocsModalProps) {
         if (isMounted) {
           const fetchedDocs: DocItem[] = data.docs || [];
           setDocs(fetchedDocs);
-          if (fetchedDocs.length > 0 && !selectedSlug) {
-            setSelectedSlug(fetchedDocs[0].slug);
+          if (fetchedDocs.length > 0) {
+            setSelectedSlug((prev) =>
+              prev && fetchedDocs.some((d) => d.slug === prev) ? prev : fetchedDocs[0].slug
+            );
           }
           setLoading(false);
         }
@@ -49,7 +63,7 @@ export function DocsModal({ isOpen, onClose }: DocsModalProps) {
     return () => {
       isMounted = false;
     };
-  }, [isOpen, selectedSlug]);
+  }, [isOpen]);
 
   // Filter docs by search query
   const filteredDocs = useMemo(() => {
@@ -68,12 +82,11 @@ export function DocsModal({ isOpen, onClose }: DocsModalProps) {
     return docs.find((d) => d.slug === selectedSlug) || docs[0] || null;
   }, [docs, selectedSlug]);
 
-  const handleCopyContent = () => {
+  const handleCopyContent = async () => {
     if (!activeDoc) return;
-    navigator.clipboard.writeText(activeDoc.content).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    });
+    const ok = await copyText(activeDoc.content);
+    setCopyStatus(ok ? 'copied' : 'failed');
+    setTimeout(() => setCopyStatus('idle'), 2000);
   };
 
   if (!isOpen) return null;
@@ -210,8 +223,10 @@ export function DocsModal({ isOpen, onClose }: DocsModalProps) {
                       onClick={handleCopyContent}
                       className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white text-xs font-medium border border-slate-700 transition-all flex items-center space-x-1.5 cursor-pointer"
                     >
-                      <span>{copied ? '✅' : '📋'}</span>
-                      <span>{copied ? 'Copied' : 'Copy Markdown'}</span>
+                      <span>{copyStatus === 'copied' ? '✅' : copyStatus === 'failed' ? '⚠️' : '📋'}</span>
+                      <span>
+                        {copyStatus === 'copied' ? 'Copied' : copyStatus === 'failed' ? 'Copy failed' : 'Copy Markdown'}
+                      </span>
                     </button>
                   </div>
                 </div>

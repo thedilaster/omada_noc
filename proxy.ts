@@ -1,6 +1,13 @@
 import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
-import { verifySessionToken, SESSION_COOKIE_NAME } from '@/lib/auth/session';
+import {
+  verifySessionToken,
+  createSessionToken,
+  sessionCookieOptions,
+  SESSION_COOKIE_NAME,
+  INACTIVITY_TIMEOUT_SECONDS,
+  SESSION_REFRESH_INTERVAL_MS,
+} from '@/lib/auth/session';
 
 export async function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;
@@ -42,7 +49,7 @@ export async function proxy(request: NextRequest) {
     const response = NextResponse.redirect(loginUrl);
     if (sessionCookie?.value) {
       // Clear expired cookie if present
-      response.cookies.delete(SESSION_COOKIE_NAME);
+      response.cookies.set({ ...sessionCookieOptions(request, 0), value: '' });
     }
     return response;
   }
@@ -57,7 +64,23 @@ export async function proxy(request: NextRequest) {
     }
   }
 
-  return NextResponse.next();
+  const response = NextResponse.next();
+
+  // Slide the session: re-sign at most once per refresh interval so active users are not
+  // logged out 15 minutes after login. Background polling also refreshes it, so the
+  // client-side InactivityTracker remains the enforcer of the 15-minute idle logout.
+  if (Date.now() - (session.lastActive || 0) > SESSION_REFRESH_INTERVAL_MS) {
+    const refreshedToken = await createSessionToken({
+      userId: session.userId,
+      username: session.username,
+      email: session.email,
+      role: session.role,
+      fullName: session.fullName,
+    });
+    response.cookies.set({ ...sessionCookieOptions(request, INACTIVITY_TIMEOUT_SECONDS), value: refreshedToken });
+  }
+
+  return response;
 }
 
 export const config = {

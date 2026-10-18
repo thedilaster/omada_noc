@@ -1,10 +1,10 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as dbQueries from '@/lib/db/queries';
 import * as schemaModule from '@/lib/db/schema';
 import * as passwordModule from '@/lib/auth/password';
 import * as sessionModule from '@/lib/auth/session';
 import { POST as loginHandler } from '@/app/api/auth/login/route';
-import { POST as logoutHandler } from '@/app/api/auth/logout/route';
+import { POST as logoutHandler, GET as logoutRedirectHandler } from '@/app/api/auth/logout/route';
 import { GET as meHandler } from '@/app/api/auth/me/route';
 import { PUT as profileHandler } from '@/app/api/auth/profile/route';
 
@@ -17,10 +17,27 @@ vi.mock('next/headers', () => ({
   }),
 }));
 
+const ADMIN_RECORD = {
+  id: 'u-123',
+  username: 'admin',
+  email: 'admin@omadanoc.com',
+  passwordHash: '$2a$10$mockHash',
+  role: 'ADMIN' as const,
+  createdAt: '2026-08-28T00:00:00Z',
+  updatedAt: '2026-08-28T00:00:00Z',
+};
+
+const loginRequest = (body: unknown, headers: Record<string, string> = {}, url = 'http://localhost/api/auth/login') =>
+  new Request(url, { method: 'POST', headers, body: JSON.stringify(body) });
+
 describe('Auth API Route Handlers', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.spyOn(schemaModule, 'initDb').mockResolvedValue();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
   });
 
   describe('POST /api/auth/login', () => {
@@ -59,6 +76,61 @@ describe('Auth API Route Handlers', () => {
       expect(json.success).toBe(true);
       expect(json.user.email).toBe('admin@omadanoc.com');
       expect(mockSetCookie).toHaveBeenCalled();
+      // Plain-HTTP deployments (http://<LAN-IP>:3000) must not get a Secure cookie
+      expect(mockSetCookie.mock.calls[0][0]).toMatchObject({ name: 'noc_session', secure: false, httpOnly: true });
+    });
+
+    it('sets a Secure cookie when the request arrived over HTTPS via a reverse proxy', async () => {
+      vi.stubEnv('COOKIE_SECURE', '');
+      vi.spyOn(dbQueries, 'findUserByEmailOrUsername').mockResolvedValue(ADMIN_RECORD);
+      vi.spyOn(passwordModule, 'verifyPassword').mockResolvedValue(true);
+      vi.spyOn(dbQueries, 'getUserProfile').mockResolvedValue(null);
+      vi.spyOn(dbQueries, 'recordLoginAttempt').mockResolvedValue();
+
+      const res = await loginHandler(
+        loginRequest({ identifier: 'admin', password: 'AdminPass123!' }, { 'x-forwarded-proto': 'https' })
+      );
+      expect(res.status).toBe(200);
+      expect((await res.json()).user.fullName).toBe('admin');
+      expect(mockSetCookie.mock.calls[0][0].secure).toBe(true);
+    });
+
+    it('audits the first X-Forwarded-For hop and truncates oversized values to column limits', async () => {
+      const recordSpy = vi.spyOn(dbQueries, 'recordLoginAttempt').mockResolvedValue();
+      vi.spyOn(dbQueries, 'findUserByEmailOrUsername').mockResolvedValue(null);
+      vi.spyOn(passwordModule, 'verifyDummyPassword').mockResolvedValue(false);
+
+      await loginHandler(
+        loginRequest({ identifier: 'ghost@test.com', password: 'pw' }, { 'x-forwarded-for': ' 203.0.113.7 , 10.0.0.1, 10.0.0.2' })
+      );
+      expect(recordSpy.mock.calls[0][2]).toBe('203.0.113.7');
+
+      const longHop = 'f'.repeat(80);
+      const longIdentifier = 'x'.repeat(400);
+      await loginHandler(loginRequest({ identifier: longIdentifier, password: 'pw' }, { 'x-forwarded-for': longHop }));
+      expect(recordSpy.mock.calls[1][1]).toHaveLength(255);
+      expect(recordSpy.mock.calls[1][2]).toBe('f'.repeat(45));
+    });
+
+    it('falls back to X-Real-IP and then loopback for the audit IP', async () => {
+      const recordSpy = vi.spyOn(dbQueries, 'recordLoginAttempt').mockResolvedValue();
+
+      await loginHandler(loginRequest({ identifier: '', password: '' }, { 'x-real-ip': ' 198.51.100.4 ' }));
+      expect(recordSpy.mock.calls[0][1]).toBe('unknown');
+      expect(recordSpy.mock.calls[0][2]).toBe('198.51.100.4');
+
+      await loginHandler(loginRequest({ identifier: 'a', password: '' }));
+      expect(recordSpy.mock.calls[1][2]).toBe('127.0.0.1');
+    });
+
+    it('runs a dummy bcrypt comparison for unknown users (no timing oracle)', async () => {
+      vi.spyOn(dbQueries, 'findUserByEmailOrUsername').mockResolvedValue(null);
+      vi.spyOn(dbQueries, 'recordLoginAttempt').mockResolvedValue();
+      const dummySpy = vi.spyOn(passwordModule, 'verifyDummyPassword').mockResolvedValue(false);
+
+      const res = await loginHandler(loginRequest({ identifier: 'nobody', password: 'guess' }));
+      expect(res.status).toBe(401);
+      expect(dummySpy).toHaveBeenCalledWith('guess');
     });
 
     it('rejects missing credentials with 400', async () => {
@@ -122,11 +194,25 @@ describe('Auth API Route Handlers', () => {
 
   describe('POST /api/auth/logout', () => {
     it('clears session cookie', async () => {
-      const res = await logoutHandler();
+      const res = await logoutHandler(new Request('http://localhost/api/auth/logout', { method: 'POST' }));
       expect(res.status).toBe(200);
       const json = await res.json();
       expect(json.success).toBe(true);
-      expect(mockSetCookie).toHaveBeenCalled();
+      expect(mockSetCookie).toHaveBeenCalledWith(
+        expect.objectContaining({ name: 'noc_session', value: '', maxAge: 0, secure: false })
+      );
+    });
+  });
+
+  describe('GET /api/auth/logout', () => {
+    it('clears the session cookie on the redirect response and sends the browser to /login', async () => {
+      const res = await logoutRedirectHandler(new Request('http://localhost:3000/api/auth/logout'));
+      expect(res.status).toBe(307);
+      expect(res.headers.get('location')).toBe('http://localhost:3000/login');
+      const setCookie = res.headers.get('set-cookie') || '';
+      expect(setCookie).toContain('noc_session=;');
+      expect(setCookie).toMatch(/Max-Age=0/i);
+      expect(setCookie).toMatch(/HttpOnly/i);
     });
   });
 
@@ -234,6 +320,20 @@ describe('Auth API Route Handlers', () => {
       const json = await res.json();
       expect(json.success).toBe(true);
       expect(json.profile.fullName).toBe('Updated Name');
+      expect(dbQueries.updateUserPassword).toHaveBeenCalledWith('u-123', '$2a$10$newHash');
+    });
+
+    it('updates profile only when no password change is requested', async () => {
+      vi.spyOn(sessionModule, 'getCurrentSession').mockResolvedValue({ userId: 'u-123', email: 'a@b.com' } as any);
+      const upsertSpy = vi.spyOn(dbQueries, 'upsertUserProfile').mockResolvedValue({ fullName: 'Only Name' } as any);
+      const pwSpy = vi.spyOn(dbQueries, 'updateUserPassword').mockResolvedValue(true);
+
+      const res = await profileHandler(
+        new Request('http://localhost', { method: 'PUT', body: JSON.stringify({ theme: 'light' }) })
+      );
+      expect(res.status).toBe(200);
+      expect(upsertSpy).toHaveBeenCalledWith('u-123', expect.objectContaining({ theme: 'light', fullName: undefined }));
+      expect(pwSpy).not.toHaveBeenCalled();
     });
 
     it('validates authentication, missing current password, and short new password', async () => {
@@ -245,8 +345,9 @@ describe('Auth API Route Handlers', () => {
       vi.spyOn(sessionModule, 'getCurrentSession').mockResolvedValue({ userId: 'u1', email: 'u@test.com' } as any);
       vi.spyOn(dbQueries, 'upsertUserProfile').mockResolvedValue({} as any);
 
-      const req1 = new Request('http://localhost', { method: 'PUT', body: JSON.stringify({ newPassword: 'NewPassword123!' }) });
+      const req1 = new Request('http://localhost', { method: 'PUT', body: JSON.stringify({ fullName: 'X', newPassword: 'NewPassword123!' }) });
       expect((await profileHandler(req1)).status).toBe(400);
+      expect(dbQueries.upsertUserProfile).not.toHaveBeenCalled();
 
       // 3. Short new password
       const req2 = new Request('http://localhost', { method: 'PUT', body: JSON.stringify({ currentPassword: 'cur', newPassword: 'short' }) });
@@ -292,6 +393,9 @@ describe('Auth API Route Handlers', () => {
       expect(res.status).toBe(400);
       const json = await res.json();
       expect(json.error).toContain('Current password provided is incorrect');
+      // Validation happens before saving, so a rejected request keeps the old profile
+      expect(dbQueries.upsertUserProfile).not.toHaveBeenCalled();
+      expect(dbQueries.updateUserPassword).not.toHaveBeenCalled();
     });
 
     it('handles unexpected exceptions and returns 500', async () => {

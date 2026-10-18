@@ -4,9 +4,12 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import path from 'path';
 import fs from 'fs';
 
-// Load .env.local if present
+// Only `npm run test:integration` talks to the real controller (using .env.local). Plain test runs
+// point the server at an unconfigured client so no login attempts can lock the controller out.
+const LIVE_CONTROLLER = process.env.OMADA_INTEGRATION === '1';
+
 const envPath = path.resolve(process.cwd(), '.env.local');
-if (fs.existsSync(envPath) && typeof process.loadEnvFile === 'function') {
+if (LIVE_CONTROLLER && fs.existsSync(envPath) && typeof process.loadEnvFile === 'function') {
   try {
     process.loadEnvFile(envPath);
   } catch {
@@ -32,11 +35,9 @@ describe('MCP Client-Server End-to-End Integration', () => {
       args: ['tsx', cliPath],
       env: {
         ...process.env,
-        OMADA_URL: process.env.OMADA_URL || '192.168.100.2',
-        OMADA_USER: process.env.OMADA_USER || 'admin',
-        OMADA_PASS: process.env.OMADA_PASS || 'password',
-        OMADA_SITE: process.env.OMADA_SITE || 'Default',
-        OMADA_ALLOW_INSECURE_SSL: 'true',
+        ...(LIVE_CONTROLLER
+          ? { OMADA_ALLOW_INSECURE_SSL: process.env.OMADA_ALLOW_INSECURE_SSL || 'true' }
+          : { OMADA_URL: 'https://127.0.0.1:1', OMADA_USER: '', OMADA_PASS: '' }),
       },
     });
 

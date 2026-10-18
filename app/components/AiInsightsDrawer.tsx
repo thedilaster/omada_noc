@@ -1,7 +1,28 @@
 'use client';
 
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { AiInsightRecord } from '@/types/reports';
+
+const COMPLETION_TOAST_MS = 4000;
+
+const insightTime = (record: AiInsightRecord): number => {
+  const t = Date.parse(record.createdAt);
+  return Number.isNaN(t) ? 0 : t;
+};
+
+/**
+ * Merge insight lists, keeping the first occurrence of each id, newest `createdAt` first.
+ * The sort is stable, so on equal timestamps earlier lists win (pass the freshest list first).
+ */
+export function mergeInsightHistory(...lists: AiInsightRecord[][]): AiInsightRecord[] {
+  const byId = new Map<string, AiInsightRecord>();
+  for (const list of lists) {
+    for (const record of list) {
+      if (!byId.has(record.id)) byId.set(record.id, record);
+    }
+  }
+  return [...byId.values()].sort((a, b) => insightTime(b) - insightTime(a));
+}
 
 export interface BackgroundAuditState {
   status: 'idle' | 'running' | 'completed' | 'error';
@@ -37,6 +58,30 @@ export function AiInsightsDrawer({
   const [adminNote, setAdminNote] = useState<string>('');
   const [feedbackToast, setFeedbackToast] = useState<string | null>(null);
   const [showThinking, setShowThinking] = useState(false);
+  const [dismissedCompletionKey, setDismissedCompletionKey] = useState<string | null>(null);
+  const feedbackToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Reset transient fetch state whenever the drawer is reopened (adjusting state on prop change)
+  const [wasOpen, setWasOpen] = useState<boolean>(isOpen);
+  if (wasOpen !== isOpen) {
+    setWasOpen(isOpen);
+    if (isOpen) {
+      setLoading(true);
+      setError(null);
+    }
+  }
+
+  const showFeedbackToast = useCallback((message: string, durationMs: number) => {
+    if (feedbackToastTimerRef.current) clearTimeout(feedbackToastTimerRef.current);
+    setFeedbackToast(message);
+    feedbackToastTimerRef.current = setTimeout(() => setFeedbackToast(null), durationMs);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (feedbackToastTimerRef.current) clearTimeout(feedbackToastTimerRef.current);
+    };
+  }, []);
 
   const isNlgRunning = localNlgRunning || (backgroundAudit?.status === 'running' && backgroundAudit.engineType === 'NLG_ALGORITHMIC');
   const isAgentRunning = localAgentRunning || (backgroundAudit?.status === 'running' && backgroundAudit.engineType === 'DEEPSEEK_AGENT');
@@ -54,11 +99,9 @@ export function AiInsightsDrawer({
         }
         const data = await res.json();
         if (isMounted) {
-          setHistory((prev) => {
-            const fetched: AiInsightRecord[] = data.history || [];
-            const unsynced = prev.filter((p) => !fetched.some((f) => f.id === p.id));
-            return [...unsynced, ...fetched];
-          });
+          const fetched: AiInsightRecord[] = data.history || [];
+          // Server records are authoritative; locally-run audits not yet in the page are kept
+          setHistory((prev) => mergeInsightHistory(fetched, prev));
           setLoading(false);
         }
       } catch (err: unknown) {
@@ -78,20 +121,31 @@ export function AiInsightsDrawer({
 
   const effectiveHistory = useMemo(() => {
     if (backgroundAudit?.status === 'completed' && backgroundAudit.result) {
-      if (!history.some((h) => h.id === backgroundAudit.result?.id)) {
-        return [backgroundAudit.result, ...history];
-      }
+      return mergeInsightHistory([backgroundAudit.result], history);
     }
     return history;
   }, [backgroundAudit, history]);
 
-  const activeToast =
-    feedbackToast ||
-    (backgroundAudit?.status === 'completed' && backgroundAudit.result
-      ? backgroundAudit.engineType === 'DEEPSEEK_AGENT'
+  // Background-completion toast: shown when the drawer is open, auto-dismissed after a few seconds
+  const completionKey =
+    backgroundAudit?.status === 'completed' && backgroundAudit.result
+      ? `${backgroundAudit.result.id}:${backgroundAudit.startTime}`
+      : null;
+
+  useEffect(() => {
+    if (!isOpen || !completionKey) return;
+    const timer = setTimeout(() => setDismissedCompletionKey(completionKey), COMPLETION_TOAST_MS);
+    return () => clearTimeout(timer);
+  }, [isOpen, completionKey]);
+
+  const completionToast =
+    completionKey && completionKey !== dismissedCompletionKey
+      ? backgroundAudit?.engineType === 'DEEPSEEK_AGENT'
         ? '🧠 DeepSeek-R1 Neural Agent completed real generative reasoning!'
         : '⚡ Deterministic NLG audit completed (Edge Heuristics Engine)!'
-      : null);
+      : null;
+
+  const activeToast = feedbackToast || completionToast;
 
   const activeError = error || (backgroundAudit?.status === 'error' ? backgroundAudit.error : null);
 
@@ -111,9 +165,8 @@ export function AiInsightsDrawer({
       }
       const data = await res.json();
       if (data.insight) {
-        setHistory((prev) => [data.insight, ...prev]);
-        setFeedbackToast('⚡ Deterministic NLG audit completed (Edge Heuristics Engine)!');
-        setTimeout(() => setFeedbackToast(null), 3500);
+        setHistory((prev) => mergeInsightHistory([data.insight], prev));
+        showFeedbackToast('⚡ Deterministic NLG audit completed (Edge Heuristics Engine)!', 3500);
       }
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Failed to run NLG audit.');
@@ -138,9 +191,8 @@ export function AiInsightsDrawer({
       }
       const data = await res.json();
       if (data.insight) {
-        setHistory((prev) => [data.insight, ...prev]);
-        setFeedbackToast('🧠 DeepSeek-R1 Neural Agent completed real generative reasoning!');
-        setTimeout(() => setFeedbackToast(null), 4000);
+        setHistory((prev) => mergeInsightHistory([data.insight], prev));
+        showFeedbackToast('🧠 DeepSeek-R1 Neural Agent completed real generative reasoning!', 4000);
       }
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Failed to run DeepSeek LLM Agent audit. Ensure Ollama is active.');
@@ -155,23 +207,25 @@ export function AiInsightsDrawer({
       [issueId]: { state: type },
     }));
 
+    // Feedback is not persisted or sent to the audit engine; say so rather than implying tuning
     const toastMsg =
       type === 'EXPECTED_IOT'
-        ? '✓ Acknowledged as Expected IoT Segregation (VLAN 20).'
+        ? '✓ Acknowledged as Expected IoT Segregation (VLAN 20), for this session only (not saved).'
         : type === 'HELPFUL'
-        ? '✓ Feedback recorded: Marked insight as helpful.'
-        : '✓ Rule tuned and suppressed for future audits.';
+        ? '✓ Marked as helpful for this session only (not saved).'
+        : '✓ Suppressed locally for this session only. Not saved; future audits will still report it.';
 
-    setFeedbackToast(toastMsg);
-    setTimeout(() => setFeedbackToast(null), 3000);
+    showFeedbackToast(toastMsg, 3000);
   };
 
   const handleSaveAdminNote = (e: React.FormEvent) => {
     e.preventDefault();
     if (!adminNote.trim()) return;
-    setFeedbackToast(`✓ Tuning Context Applied: "${adminNote.trim().slice(0, 40)}..."`);
+    showFeedbackToast(
+      `✓ Note kept locally for this session only (not sent to the audit engine): "${adminNote.trim().slice(0, 40)}..."`,
+      3000
+    );
     setAdminNote('');
-    setTimeout(() => setFeedbackToast(null), 3000);
   };
 
   if (!isOpen) return null;

@@ -7,6 +7,7 @@ import {
   memoryUpdateUserRole,
   memoryUpdateUserPassword,
   memoryDeleteUser,
+  memoryCountAdmins,
   memoryListAllUsersWithDetails,
   memoryGetUserProfile,
   memoryUpsertUserProfile,
@@ -37,6 +38,10 @@ describe('In-Memory Database Store (Development Fallback)', () => {
     const userById = await memoryFindUserById(userByEmail!.id);
     expect(userById?.email).toBe('admin@omadanoc.com');
 
+    // Only the login lookup exposes the hash (admin routes serialize findUserById results)
+    expect(userByEmail?.passwordHash).toBeTruthy();
+    expect(userById).not.toHaveProperty('passwordHash');
+
     const nonExistent = await memoryFindUserByEmailOrUsername('nonexistent@user.com');
     expect(nonExistent).toBeNull();
   });
@@ -46,10 +51,19 @@ describe('In-Memory Database Store (Development Fallback)', () => {
     expect(newUser.username).toBe('testuser');
     expect(newUser.email).toBe('test@example.com');
     expect(newUser.role).toBe('USER');
+    expect(newUser).not.toHaveProperty('passwordHash');
+    expect(newUser.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+
+    // The stored record still keeps the hash for login
+    expect((await memoryFindUserByEmailOrUsername('testuser'))?.passwordHash).toBe('hashed123');
+
+    const adminsBefore = await memoryCountAdmins();
 
     // Update role
     const updated = await memoryUpdateUserRole(newUser.id, 'ADMIN');
     expect(updated?.role).toBe('ADMIN');
+    expect(updated).not.toHaveProperty('passwordHash');
+    expect(await memoryCountAdmins()).toBe(adminsBefore + 1);
 
     // Update role for non-existent user
     const noRole = await memoryUpdateUserRole('fake-id', 'USER');
@@ -91,6 +105,16 @@ describe('In-Memory Database Store (Development Fallback)', () => {
     expect(updatedProfile.jobTitle).toBe('Principal NOC Architect');
     expect(updatedProfile.department).toBe('Infrastructure');
 
+    // Explicitly undefined keys (omitted form fields) must not blank existing values
+    const partial = await memoryUpsertUserProfile('00000000-0000-0000-0000-000000000001', {
+      fullName: undefined,
+      jobTitle: undefined,
+      theme: 'light',
+    });
+    expect(partial.fullName).toBe('System Administrator');
+    expect(partial.jobTitle).toBe('Principal NOC Architect');
+    expect(partial.theme).toBe('light');
+
     // Upsert profile for a new user without existing profile
     const newProfile = await memoryUpsertUserProfile('brand-new-user-id', {
       fullName: 'New Person',
@@ -108,15 +132,19 @@ describe('In-Memory Database Store (Development Fallback)', () => {
     expect(emptyTags).toEqual([]);
 
     const tag = await memoryTagDeviceToUser('00000000-0000-0000-0000-000000000001', '00:11:22:33:44:55', 'Core Gateway');
-    expect(tag.macAddress).toBe('00:11:22:33:44:55');
+    // Stored canonically in Omada's dashed notation
+    expect(tag.macAddress).toBe('00-11-22-33-44-55');
     expect(tag.deviceName).toBe('Core Gateway');
 
-    // Update existing tag deviceName
-    const updatedTag = await memoryTagDeviceToUser('00000000-0000-0000-0000-000000000001', '00:11:22:33:44:55', 'Updated Gateway');
+    // Update existing tag deviceName (same MAC, different notation)
+    const updatedTag = await memoryTagDeviceToUser('00000000-0000-0000-0000-000000000001', '00-11-22-33-44-55', 'Updated Gateway');
+    expect(updatedTag.id).toBe(tag.id);
     expect(updatedTag.deviceName).toBe('Updated Gateway');
 
     const tags = await memoryGetUserDeviceTags('00000000-0000-0000-0000-000000000001');
-    expect(tags.some((t) => t.macAddress === '00:11:22:33:44:55')).toBe(true);
+    expect(tags.some((t) => t.macAddress === '00-11-22-33-44-55')).toBe(true);
+
+    await expect(memoryTagDeviceToUser('00000000-0000-0000-0000-000000000001', 'not-a-mac')).rejects.toThrow('Invalid MAC');
 
     const removed = await memoryRemoveDeviceTagFromUser('00000000-0000-0000-0000-000000000001', '00:11:22:33:44:55');
     expect(removed).toBe(true);
@@ -126,7 +154,18 @@ describe('In-Memory Database Store (Development Fallback)', () => {
     expect(removedNonExistent).toBe(false);
 
     const tagsAfter = await memoryGetUserDeviceTags('00000000-0000-0000-0000-000000000001');
-    expect(tagsAfter.some((t) => t.macAddress === '00:11:22:33:44:55')).toBe(false);
+    expect(tagsAfter.some((t) => t.macAddress === '00-11-22-33-44-55')).toBe(false);
+  });
+
+  it('lists tagged devices per user and removes them with the user', async () => {
+    const owner = await memoryCreateUser('tagowner', 'tagowner@example.com', 'hash');
+    await memoryTagDeviceToUser(owner.id, 'aa:bb:cc:00:00:01', 'Phone');
+
+    const listed = (await memoryListAllUsersWithDetails()).find((u) => u.id === owner.id);
+    expect(listed?.taggedDevices.map((t) => t.macAddress)).toEqual(['AA-BB-CC-00-00-01']);
+
+    expect(await memoryDeleteUser(owner.id)).toBe(true);
+    expect(await memoryGetUserDeviceTags(owner.id)).toEqual([]);
   });
 
   it('records and paginates login audit history in memory', async () => {

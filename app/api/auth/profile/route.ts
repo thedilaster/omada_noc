@@ -17,16 +17,8 @@ export async function PUT(request: Request) {
     const body = await request.json();
     const { fullName, jobTitle, department, avatarUrl, theme, currentPassword, newPassword } = body;
 
-    // 1. Update Profile Information
-    const updatedProfile = await upsertUserProfile(session.userId, {
-      fullName,
-      jobTitle,
-      department,
-      avatarUrl,
-      theme,
-    });
-
-    // 2. Optional Password Change
+    // 1. Validate an optional password change first so a rejected request saves nothing
+    let newPasswordHash: string | null = null;
     if (newPassword) {
       if (!currentPassword) {
         return NextResponse.json(
@@ -55,8 +47,21 @@ export async function PUT(request: Request) {
         );
       }
 
-      const newHash = await hashPassword(newPassword);
-      await updateUserPassword(session.userId, newHash);
+      newPasswordHash = await hashPassword(newPassword);
+    }
+
+    // 2. Update Profile Information
+    const updatedProfile = await upsertUserProfile(session.userId, {
+      fullName,
+      jobTitle,
+      department,
+      avatarUrl,
+      theme,
+    });
+
+    // 3. Apply the validated password change
+    if (newPasswordHash) {
+      await updateUserPassword(session.userId, newPasswordHash);
     }
 
     return NextResponse.json({

@@ -12,6 +12,12 @@ describe('ThroughputSparkline Component', () => {
     expect(screen.getByText(/16 KB\/s/i)).toBeInTheDocument();
   });
 
+  it('scales the ping animation around the dot itself (transform-box: fill-box)', () => {
+    const { container } = render(<ThroughputSparkline history={[1, 2, 3]} currentRate={3} />);
+    const dot = container.querySelector('circle');
+    expect(dot).toHaveClass('animate-ping', 'origin-center', '[transform-box:fill-box]');
+  });
+
   it('handles empty history gracefully and renders default path', () => {
     render(<ThroughputSparkline history={[]} currentRate={0} />);
     expect(screen.getByText(/Peak:/i)).toBeInTheDocument();

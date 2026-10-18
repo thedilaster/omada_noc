@@ -223,45 +223,48 @@ export function generateNocPdfReport(data: ReportSummaryData): jsPDF {
 
   currentY = (doc as AutoTableDoc).lastAutoTable.finalY + 8;
 
-  // 6. Section: Top Active System Operators & Security Summary
-  if (currentY > pageHeight - 50) {
-    doc.addPage();
-    currentY = 20;
+  // 6. Section: Top Active System Operators & Security Summary (admin reports only)
+  if (data.securitySummary) {
+    if (currentY > pageHeight - 50) {
+      doc.addPage();
+      currentY = 20;
+    }
+
+    doc.setFontSize(11);
+    doc.setFont('helvetica', 'bold');
+    doc.setTextColor(15, 23, 42);
+    doc.text('4. Multi-Tenant Scoping & Security Summary', margin, currentY);
+    currentY += 4;
+
+    const userRows = data.topActiveUsers.map((u) => [
+      u.fullName || u.username,
+      u.email,
+      u.role,
+      `${u.taggedDevicesCount} device(s)`,
+      new Date(u.lastActiveDate).toLocaleDateString(),
+    ]);
+
+    autoTable(doc, {
+      startY: currentY,
+      head: [['User / Operator', 'Email Address', 'Role', 'Tagged Hardware', 'Last Active']],
+      body: userRows.length > 0 ? userRows : [['No user accounts registered', '-', '-', '-', '-']],
+      theme: 'grid',
+      headStyles: { fillColor: [51, 65, 85], textColor: [255, 255, 255], fontSize: 8, fontStyle: 'bold' },
+      bodyStyles: { fontSize: 8, textColor: [51, 65, 85] },
+      alternateRowStyles: { fillColor: [248, 250, 252] },
+      margin: { left: margin, right: margin },
+    });
   }
 
-  doc.setFontSize(11);
-  doc.setFont('helvetica', 'bold');
-  doc.setTextColor(15, 23, 42);
-  doc.text('4. Multi-Tenant Scoping & Security Summary', margin, currentY);
-  currentY += 4;
-
-  const userRows = data.topActiveUsers.map((u) => [
-    u.fullName || u.username,
-    u.email,
-    u.role,
-    `${u.taggedDevicesCount} device(s)`,
-    new Date(u.lastActiveDate).toLocaleDateString(),
-  ]);
-
-  autoTable(doc, {
-    startY: currentY,
-    head: [['User / Operator', 'Email Address', 'Role', 'Tagged Hardware', 'Last Active']],
-    body: userRows.length > 0 ? userRows : [['No user accounts registered', '-', '-', '-', '-']],
-    theme: 'grid',
-    headStyles: { fillColor: [51, 65, 85], textColor: [255, 255, 255], fontSize: 8, fontStyle: 'bold' },
-    bodyStyles: { fontSize: 8, textColor: [51, 65, 85] },
-    alternateRowStyles: { fillColor: [248, 250, 252] },
-    margin: { left: margin, right: margin },
-  });
-
-  // Footer on all pages
+  // Footer on all pages (a non-cryptographic identifier for this export)
+  const reportId = Date.now().toString(16).toUpperCase();
   const totalPages = doc.getNumberOfPages();
   for (let i = 1; i <= totalPages; i++) {
     doc.setPage(i);
     doc.setFontSize(7.5);
     doc.setTextColor(148, 163, 184);
     doc.text(
-      `OMADA.NOC Confidential Executive Report • Page ${i} of ${totalPages} • Cryptographic Hash: SHA256-${Date.now().toString(16).toUpperCase()}`,
+      `OMADA.NOC Confidential Executive Report • Page ${i} of ${totalPages} • Report ID: ${reportId}`,
       pageWidth / 2,
       pageHeight - 8,
       { align: 'center' }

@@ -1,5 +1,6 @@
 import React from 'react';
-import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
+import { renderToString } from 'react-dom/server';
+import { render, screen, fireEvent, waitFor, act, within } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import Dashboard from '@/app/components/Dashboard';
 import { TelemetryResponse } from '@/types/omada';
@@ -544,11 +545,11 @@ describe('Dashboard Client Component', () => {
     expect(screen.queryByRole('dialog', { name: /Client Diagnostic Deep-Dive/i })).not.toBeInTheDocument();
   });
 
-  it('copies diagnostic snapshot to clipboard and triggers Live Events modal', () => {
-    Object.assign(navigator, {
-      clipboard: {
-        writeText: vi.fn(),
-      },
+  it('copies diagnostic snapshot to clipboard and triggers Live Events modal', async () => {
+    Object.defineProperty(navigator, 'clipboard', {
+      value: { writeText: vi.fn().mockResolvedValue(undefined) },
+      configurable: true,
+      writable: true,
     });
 
     render(<Dashboard initialData={mockInitialData} />);
@@ -557,7 +558,7 @@ describe('Dashboard Client Component', () => {
     const snapshotBtn = screen.getByRole('button', { name: /Snapshot/i });
     fireEvent.click(snapshotBtn);
     expect(navigator.clipboard.writeText).toHaveBeenCalled();
-    expect(screen.getByText(/Diagnostic snapshot copied to clipboard!/i)).toBeInTheDocument();
+    expect(await screen.findByText(/Diagnostic snapshot copied to clipboard!/i)).toBeInTheDocument();
 
     // Click Live Events button
     const eventsBtn = screen.getByRole('button', { name: /Live Events/i });
@@ -825,6 +826,275 @@ describe('Dashboard Client Component', () => {
         }),
       });
     });
+  });
+
+  it('shows a failure toast when the clipboard is unavailable (plain HTTP) and the fallback fails', async () => {
+    vi.useFakeTimers();
+    Object.defineProperty(navigator, 'clipboard', { value: undefined, configurable: true, writable: true });
+    Object.defineProperty(document, 'execCommand', {
+      value: vi.fn().mockReturnValue(false),
+      configurable: true,
+      writable: true,
+    });
+
+    render(<Dashboard initialData={mockInitialData} />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /Snapshot/i }));
+    });
+    expect(screen.getByText(/could not copy the diagnostic snapshot/i)).toBeInTheDocument();
+    expect(screen.queryByText(/copied to clipboard!/i)).not.toBeInTheDocument();
+
+    // Fallback copy succeeds on a second attempt; previous toast timer is replaced
+    (document.execCommand as unknown as ReturnType<typeof vi.fn>).mockReturnValue(true);
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /Snapshot/i }));
+    });
+    expect(screen.getByText(/Diagnostic snapshot copied to clipboard!/i)).toBeInTheDocument();
+
+    // Toast auto-dismisses
+    await act(async () => {
+      vi.advanceTimersByTime(3000);
+    });
+    expect(screen.queryByText(/Diagnostic snapshot copied to clipboard!/i)).not.toBeInTheDocument();
+
+    Object.defineProperty(document, 'execCommand', { value: undefined, configurable: true, writable: true });
+  });
+
+  it('derives the header system status from controllerOnline', () => {
+    const { unmount } = render(<Dashboard initialData={mockInitialData} />);
+    expect(screen.getByText('SYSTEM ONLINE')).toBeInTheDocument();
+    expect(screen.queryByText('SYSTEM OFFLINE')).not.toBeInTheDocument();
+    unmount();
+
+    render(
+      <Dashboard
+        initialData={{ ...mockInitialData, status: { ...mockInitialData.status, controllerOnline: false } }}
+      />
+    );
+    expect(screen.getByText('SYSTEM OFFLINE')).toBeInTheDocument();
+    expect(screen.queryByText('SYSTEM ONLINE')).not.toBeInTheDocument();
+  });
+
+  it('renders no locale-dependent heartbeat time on the server, then the local time after mount', () => {
+    const html = renderToString(<Dashboard initialData={mockInitialData} />);
+    const expectedTime = new Date(mockInitialData.status.lastUpdated).toLocaleTimeString();
+    expect(html).not.toContain(expectedTime);
+
+    render(<Dashboard initialData={mockInitialData} />);
+    expect(screen.getByText(`Heartbeat: ${expectedTime}`)).toBeInTheDocument();
+  });
+
+  it('renders an empty heartbeat for an unparseable lastUpdated timestamp', () => {
+    render(
+      <Dashboard
+        initialData={{ ...mockInitialData, status: { ...mockInitialData.status, lastUpdated: 'not-a-date' } }}
+      />
+    );
+    expect(screen.getByText(/^Heartbeat:\s*$/)).toBeInTheDocument();
+  });
+
+  it('skips polling ticks while a telemetry request is still in flight', async () => {
+    vi.useFakeTimers();
+    let resolveTelemetry: ((value: unknown) => void) | undefined;
+    global.fetch = vi.fn().mockImplementation((url: string) => {
+      if (url.includes('/api/auth/me')) {
+        return Promise.resolve({ ok: true, status: 200, json: async () => ({ authenticated: false }) });
+      }
+      return new Promise((resolve) => {
+        resolveTelemetry = resolve;
+      });
+    });
+    const telemetryCalls = () =>
+      (global.fetch as any).mock.calls.filter(([url]: [string]) => url.includes('/api/telemetry')).length;
+
+    render(<Dashboard initialData={mockInitialData} />);
+    fireEvent.change(screen.getByRole('combobox', { name: /polling interval/i }), { target: { value: '5' } });
+
+    await act(async () => {
+      vi.advanceTimersByTime(5000);
+    });
+    expect(telemetryCalls()).toBe(1);
+
+    // Further ticks while the first request hangs are skipped
+    await act(async () => {
+      vi.advanceTimersByTime(15000);
+    });
+    expect(telemetryCalls()).toBe(1);
+
+    // Once it settles, the next tick polls again
+    await act(async () => {
+      resolveTelemetry?.({ ok: true, status: 200, json: async () => mockInitialData });
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(5000);
+    });
+    expect(telemetryCalls()).toBe(2);
+  });
+
+  it('matches clients by AP name in the search box', () => {
+    render(<Dashboard initialData={mockInitialData} />);
+    fireEvent.change(screen.getByPlaceholderText(/search by device/i), { target: { value: 'ap-lobby' } });
+    expect(screen.getByText('MacBook Pro')).toBeInTheDocument();
+    expect(screen.queryByText('Core Server')).not.toBeInTheDocument();
+    expect(screen.queryByText('Executive iPad')).not.toBeInTheDocument();
+  });
+
+  it('keeps the client inspector in sync with refreshed telemetry', async () => {
+    const refreshed: TelemetryResponse = {
+      ...mockInitialData,
+      topClients: mockInitialData.topClients.map((c) =>
+        c.mac === 'AA-BB-CC-DD-EE-01' ? { ...c, rssi: -82 } : c
+      ),
+    };
+    global.fetch = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes('/api/auth/me')) {
+        return { ok: true, status: 200, json: async () => ({ authenticated: false }) };
+      }
+      return { ok: true, status: 200, json: async () => refreshed };
+    });
+
+    render(<Dashboard initialData={mockInitialData} />);
+    fireEvent.click(screen.getByText('MacBook Pro'));
+    const dialog = screen.getByRole('dialog', { name: /Client Diagnostic Deep-Dive/i });
+    expect(within(dialog).getByText('-55 dBm')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /^refresh$/i }));
+
+    await waitFor(() => {
+      const updated = screen.getByRole('dialog', { name: /Client Diagnostic Deep-Dive/i });
+      expect(within(updated).getByText('-82 dBm')).toBeInTheDocument();
+      expect(within(updated).getByText(/Weak \/ Degraded/i)).toBeInTheDocument();
+    });
+  });
+
+  it('closes the inspector when the selected client disappears from telemetry', async () => {
+    const refreshed: TelemetryResponse = {
+      ...mockInitialData,
+      topClients: mockInitialData.topClients.filter((c) => c.mac !== 'AA-BB-CC-DD-EE-01'),
+    };
+    global.fetch = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes('/api/auth/me')) {
+        return { ok: true, status: 200, json: async () => ({ authenticated: false }) };
+      }
+      return { ok: true, status: 200, json: async () => refreshed };
+    });
+
+    render(<Dashboard initialData={mockInitialData} />);
+    fireEvent.click(screen.getByText('MacBook Pro'));
+    expect(screen.getByRole('dialog', { name: /Client Diagnostic Deep-Dive/i })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /^refresh$/i }));
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog', { name: /Client Diagnostic Deep-Dive/i })).not.toBeInTheDocument();
+    });
+  });
+
+  it('dismisses the completed background audit badge without opening the drawer', async () => {
+    let releaseAudit: (() => void) | undefined;
+    const auditGate = new Promise<void>((resolve) => {
+      releaseAudit = resolve;
+    });
+    global.fetch = vi.fn().mockImplementation(async (url: string, opts?: any) => {
+      if (url.includes('/api/auth/me')) {
+        return { ok: true, status: 200, json: async () => ({ user: { role: 'ADMIN' } }) };
+      }
+      if (url.includes('/api/admin/insights/history')) {
+        return { ok: true, status: 200, json: async () => ({ history: [] }) };
+      }
+      if (url.includes('/api/admin/insights/run') && opts?.method === 'POST') {
+        await auditGate;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            insight: {
+              id: 'ins-dismiss',
+              createdAt: '2026-08-28T12:00:00Z',
+              healthScore: 77,
+              engineType: 'NLG_ALGORITHMIC',
+              executiveSummary: 'Done.',
+              persistingIssues: [],
+              resolvedIssues: [],
+              newIssues: [],
+              actionableSuggestions: [],
+            },
+          }),
+        };
+      }
+      return { ok: true, status: 200, json: async () => mockInitialData };
+    });
+
+    render(<Dashboard initialData={mockInitialData} />);
+    fireEvent.click(await screen.findByRole('button', { name: /AI Insights/i }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /Trigger NLG Audit/i }));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /Push to Background/i }));
+    });
+    await act(async () => {
+      releaseAudit?.();
+    });
+
+    expect(await screen.findByText(/NLG Audit Complete/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
+    expect(screen.queryByText(/NLG Audit Complete/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole('dialog', { name: 'Continuous AI & NLG Engine' })).not.toBeInTheDocument();
+  });
+
+  it('shows the error badge when a background NLG audit fails', async () => {
+    let releaseAudit: (() => void) | undefined;
+    const auditGate = new Promise<void>((resolve) => {
+      releaseAudit = resolve;
+    });
+    global.fetch = vi.fn().mockImplementation(async (url: string, opts?: any) => {
+      if (url.includes('/api/auth/me')) {
+        return { ok: true, status: 200, json: async () => ({ user: { role: 'ADMIN' } }) };
+      }
+      if (url.includes('/api/admin/insights/history')) {
+        return { ok: true, status: 200, json: async () => ({ history: [] }) };
+      }
+      if (url.includes('/api/admin/insights/run') && opts?.method === 'POST') {
+        await auditGate;
+        return { ok: false, status: 500, json: async () => ({ error: 'Heuristics engine crashed' }) };
+      }
+      return { ok: true, status: 200, json: async () => mockInitialData };
+    });
+
+    render(<Dashboard initialData={mockInitialData} />);
+    fireEvent.click(await screen.findByRole('button', { name: /AI Insights/i }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /Trigger NLG Audit/i }));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /Push to Background/i }));
+    });
+    await act(async () => {
+      releaseAudit?.();
+    });
+
+    expect(await screen.findByText(/Audit Execution Error/i)).toBeInTheDocument();
+    expect(screen.getByText(/Heuristics engine crashed/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
+    expect(screen.queryByText(/Audit Execution Error/i)).not.toBeInTheDocument();
+  });
+
+  it('redirects to login when the telemetry poll or session check returns 401', async () => {
+    global.fetch = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes('/api/auth/me')) {
+        return { ok: false, status: 401, json: async () => ({}) };
+      }
+      return { ok: false, status: 401, json: async () => ({}) };
+    });
+
+    render(<Dashboard initialData={mockInitialData} />);
+    fireEvent.click(screen.getByRole('button', { name: /^refresh$/i }));
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /^refresh$/i })).not.toBeDisabled();
+    });
+    // A 401 must not be rendered as a controller outage
+    expect(screen.getByText(/Controller Online/i)).toBeInTheDocument();
   });
 
   it('handles connection notice retry and dismiss interactions', async () => {

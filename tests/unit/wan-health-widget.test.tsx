@@ -69,4 +69,73 @@ describe('WanHealthWidget Component', () => {
     fireEvent.click(screen.getByRole('button', { name: /Hide Details/i }));
     expect(screen.queryByText('PRIMARY ROUTE')).not.toBeInTheDocument();
   });
+
+  const offlineWan = (): WanStatusInfo => ({
+    gatewayModel: 'ER605',
+    primaryWan: {
+      port: 1,
+      name: 'WAN1',
+      type: 'wan',
+      online: false,
+      ip: '0.0.0.0',
+      gateway: '',
+      dns: undefined as unknown as string[],
+      proto: 'DHCP',
+      latencyMs: undefined as unknown as number,
+      packetLossPercent: undefined as unknown as number,
+      rxRate: undefined as unknown as number,
+      txRate: undefined as unknown as number,
+      uptime: 0,
+    },
+    backupWan: {
+      port: 2,
+      name: 'WAN2',
+      type: 'wan/lan',
+      online: false,
+      ip: '0.0.0.0',
+      gateway: '',
+      dns: [],
+      proto: 'DHCP',
+      latencyMs: undefined as unknown as number,
+      packetLossPercent: 0,
+      rxRate: 0,
+      txRate: 0,
+      uptime: 0,
+    },
+    dualWanMode: 'Failover',
+    overallUptimePercent: 0,
+  });
+
+  it('shows OFFLINE and dashes instead of invented metrics when the WAN is down', () => {
+    render(<WanHealthWidget wanStatus={offlineWan()} />);
+    expect(screen.getByText('OFFLINE')).toBeInTheDocument();
+    expect(screen.queryByText('ONLINE')).not.toBeInTheDocument();
+    expect(screen.getByText('— Ping')).toBeInTheDocument();
+    expect(screen.getByText('↓ —')).toBeInTheDocument();
+    expect(screen.getByText('↑ —')).toBeInTheDocument();
+    expect(screen.queryByText(/undefined/)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /WAN Details/i }));
+    expect(screen.getByText('STANDBY OFFLINE')).toBeInTheDocument();
+    expect(screen.getAllByText('—').length).toBeGreaterThanOrEqual(4);
+    expect(screen.queryByText(/undefined/)).not.toBeInTheDocument();
+  });
+
+  it('shows UNKNOWN when the controller does not report link state and keeps zero rates', () => {
+    const wan = offlineWan();
+    wan.primaryWan = {
+      ...wan.primaryWan,
+      online: undefined as unknown as boolean,
+      latencyMs: 30,
+      packetLossPercent: 1.5,
+      rxRate: 0,
+      txRate: 2048,
+    };
+    render(<WanHealthWidget wanStatus={wan} />);
+    expect(screen.getByText('UNKNOWN')).toBeInTheDocument();
+    expect(screen.getByText('30ms Ping')).toBeInTheDocument();
+    expect(screen.getByText('1.5%')).toBeInTheDocument();
+    expect(screen.getByText('↓ 0 B/s')).toBeInTheDocument();
+    expect(screen.getByText('↑ 2 KB/s')).toBeInTheDocument();
+  });
 });

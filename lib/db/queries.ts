@@ -1,10 +1,11 @@
 import {
   getDbPool,
   isMemoryFallbackActive,
-  activateMemoryFallback,
   resetMemoryFallback,
-  isConnectionOrAuthError,
+  shouldFallbackToMemory,
 } from './pool';
+import { isUuid, toCanonicalMac } from './validation';
+import { normalizeMac } from '@/lib/omada/formatters';
 import {
   UserRecord,
   UserProfile,
@@ -21,6 +22,7 @@ import {
   memoryUpdateUserRole,
   memoryUpdateUserPassword,
   memoryDeleteUser,
+  memoryCountAdmins,
   memoryListAllUsersWithDetails,
   memoryGetUserProfile,
   memoryUpsertUserProfile,
@@ -61,8 +63,7 @@ export async function findUserByEmailOrUsername(
     if (res.rows.length === 0) return null;
     return res.rows[0];
   } catch (err) {
-    if (isConnectionOrAuthError(err)) {
-      activateMemoryFallback((err as Error).message);
+    if (shouldFallbackToMemory(err)) {
       return (await memoryFindUserByEmailOrUsername(identifier)) as (UserRecord & { passwordHash: string }) | null;
     }
     throw err;
@@ -73,6 +74,9 @@ export async function findUserByEmailOrUsername(
  * Finds a user by unique UUID.
  */
 export async function findUserById(id: string): Promise<UserRecord | null> {
+  // Malformed ids can never match (and would make Postgres raise 22P02)
+  if (!isUuid(id)) return null;
+
   if (isMemoryFallbackActive()) {
     return memoryFindUserById(id);
   }
@@ -90,8 +94,7 @@ export async function findUserById(id: string): Promise<UserRecord | null> {
     if (res.rows.length === 0) return null;
     return res.rows[0];
   } catch (err) {
-    if (isConnectionOrAuthError(err)) {
-      activateMemoryFallback((err as Error).message);
+    if (shouldFallbackToMemory(err)) {
       return memoryFindUserById(id);
     }
     throw err;
@@ -144,8 +147,7 @@ export async function createUser(
       client.release();
     }
   } catch (err) {
-    if (isConnectionOrAuthError(err)) {
-      activateMemoryFallback((err as Error).message);
+    if (shouldFallbackToMemory(err)) {
       return memoryCreateUser(username, email, passwordHash, role, fullName);
     }
     throw err;
@@ -159,6 +161,8 @@ export async function updateUserRole(
   id: string,
   role: UserRole
 ): Promise<UserRecord | null> {
+  if (!isUuid(id)) return null;
+
   if (isMemoryFallbackActive()) {
     return memoryUpdateUserRole(id, role);
   }
@@ -176,8 +180,7 @@ export async function updateUserRole(
     if (res.rows.length === 0) return null;
     return res.rows[0];
   } catch (err) {
-    if (isConnectionOrAuthError(err)) {
-      activateMemoryFallback((err as Error).message);
+    if (shouldFallbackToMemory(err)) {
       return memoryUpdateUserRole(id, role);
     }
     throw err;
@@ -191,6 +194,8 @@ export async function updateUserPassword(
   id: string,
   passwordHash: string
 ): Promise<boolean> {
+  if (!isUuid(id)) return false;
+
   if (isMemoryFallbackActive()) {
     return memoryUpdateUserPassword(id, passwordHash);
   }
@@ -206,8 +211,7 @@ export async function updateUserPassword(
 
     return (res.rowCount ?? 0) > 0;
   } catch (err) {
-    if (isConnectionOrAuthError(err)) {
-      activateMemoryFallback((err as Error).message);
+    if (shouldFallbackToMemory(err)) {
       return memoryUpdateUserPassword(id, passwordHash);
     }
     throw err;
@@ -218,6 +222,8 @@ export async function updateUserPassword(
  * Deletes a user account.
  */
 export async function deleteUser(id: string): Promise<boolean> {
+  if (!isUuid(id)) return false;
+
   if (isMemoryFallbackActive()) {
     return memoryDeleteUser(id);
   }
@@ -227,9 +233,28 @@ export async function deleteUser(id: string): Promise<boolean> {
     const res = await pool.query(`DELETE FROM users WHERE id = $1`, [id]);
     return (res.rowCount ?? 0) > 0;
   } catch (err) {
-    if (isConnectionOrAuthError(err)) {
-      activateMemoryFallback((err as Error).message);
+    if (shouldFallbackToMemory(err)) {
       return memoryDeleteUser(id);
+    }
+    throw err;
+  }
+}
+
+/**
+ * Counts accounts holding the ADMIN role (used to prevent admin lockout).
+ */
+export async function countAdmins(): Promise<number> {
+  if (isMemoryFallbackActive()) {
+    return memoryCountAdmins();
+  }
+
+  try {
+    const pool = getDbPool();
+    const res = await pool.query(`SELECT COUNT(*) as count FROM users WHERE role = 'ADMIN'`);
+    return parseInt(res.rows[0]?.count || '0', 10);
+  } catch (err) {
+    if (shouldFallbackToMemory(err)) {
+      return memoryCountAdmins();
     }
     throw err;
   }
@@ -285,8 +310,7 @@ export async function listAllUsersWithDetails(): Promise<UserWithDetails[]> {
       taggedDevices: tagsByUserId.get(row.id) || [],
     }));
   } catch (err) {
-    if (isConnectionOrAuthError(err)) {
-      activateMemoryFallback((err as Error).message);
+    if (shouldFallbackToMemory(err)) {
       return memoryListAllUsersWithDetails();
     }
     throw err;
@@ -297,6 +321,8 @@ export async function listAllUsersWithDetails(): Promise<UserWithDetails[]> {
  * Retrieves a user's extended profile.
  */
 export async function getUserProfile(userId: string): Promise<UserProfile | null> {
+  if (!isUuid(userId)) return null;
+
   if (isMemoryFallbackActive()) {
     return memoryGetUserProfile(userId);
   }
@@ -314,8 +340,7 @@ export async function getUserProfile(userId: string): Promise<UserProfile | null
     if (res.rows.length === 0) return null;
     return res.rows[0];
   } catch (err) {
-    if (isConnectionOrAuthError(err)) {
-      activateMemoryFallback((err as Error).message);
+    if (shouldFallbackToMemory(err)) {
       return memoryGetUserProfile(userId);
     }
     throw err;
@@ -339,11 +364,13 @@ export async function upsertUserProfile(
       `INSERT INTO user_profiles (user_id, full_name, job_title, department, avatar_url, theme, updated_at)
        VALUES ($1, COALESCE($2, ''), COALESCE($3, ''), COALESCE($4, ''), COALESCE($5, ''), COALESCE($6, 'dark'), NOW())
        ON CONFLICT (user_id) DO UPDATE
-       SET full_name = COALESCE(EXCLUDED.full_name, user_profiles.full_name),
-           job_title = COALESCE(EXCLUDED.job_title, user_profiles.job_title),
-           department = COALESCE(EXCLUDED.department, user_profiles.department),
-           avatar_url = COALESCE(EXCLUDED.avatar_url, user_profiles.avatar_url),
-           theme = COALESCE(EXCLUDED.theme, user_profiles.theme),
+       -- Use the raw parameters here: EXCLUDED already holds the defaulted INSERT values,
+       -- which would blank omitted fields and reset the theme on a partial update.
+       SET full_name = COALESCE($2, user_profiles.full_name),
+           job_title = COALESCE($3, user_profiles.job_title),
+           department = COALESCE($4, user_profiles.department),
+           avatar_url = COALESCE($5, user_profiles.avatar_url),
+           theme = COALESCE($6, user_profiles.theme),
            updated_at = NOW()
        RETURNING id, user_id as "userId", full_name as "fullName", job_title as "jobTitle", department, avatar_url as "avatarUrl", theme, updated_at as "updatedAt"`,
       [
@@ -358,8 +385,7 @@ export async function upsertUserProfile(
 
     return res.rows[0];
   } catch (err) {
-    if (isConnectionOrAuthError(err)) {
-      activateMemoryFallback((err as Error).message);
+    if (shouldFallbackToMemory(err)) {
       return memoryUpsertUserProfile(userId, data);
     }
     throw err;
@@ -370,6 +396,8 @@ export async function upsertUserProfile(
  * Retrieves all device MAC address tags assigned to a user.
  */
 export async function getUserDeviceTags(userId: string): Promise<UserDeviceTag[]> {
+  if (!isUuid(userId)) return [];
+
   if (isMemoryFallbackActive()) {
     return memoryGetUserDeviceTags(userId);
   }
@@ -386,8 +414,7 @@ export async function getUserDeviceTags(userId: string): Promise<UserDeviceTag[]
 
     return res.rows;
   } catch (err) {
-    if (isConnectionOrAuthError(err)) {
-      activateMemoryFallback((err as Error).message);
+    if (shouldFallbackToMemory(err)) {
       return memoryGetUserDeviceTags(userId);
     }
     throw err;
@@ -395,20 +422,24 @@ export async function getUserDeviceTags(userId: string): Promise<UserDeviceTag[]
 }
 
 /**
- * Tags a MAC address to a user.
+ * Tags a MAC address to a user. MACs are stored canonically as "AA-BB-CC-DD-EE-FF".
  */
 export async function tagDeviceToUser(
   userId: string,
   macAddress: string,
   deviceName: string = ''
 ): Promise<UserDeviceTag> {
+  const canonicalMac = toCanonicalMac(macAddress);
+  if (!canonicalMac) {
+    throw new Error(`Invalid MAC address: ${macAddress}`);
+  }
+
   if (isMemoryFallbackActive()) {
-    return memoryTagDeviceToUser(userId, macAddress, deviceName);
+    return memoryTagDeviceToUser(userId, canonicalMac, deviceName);
   }
 
   try {
     const pool = getDbPool();
-    const normalizedMac = macAddress.toUpperCase().trim();
 
     const res = await pool.query(
       `INSERT INTO user_device_tags (user_id, mac_address, device_name)
@@ -416,14 +447,13 @@ export async function tagDeviceToUser(
        ON CONFLICT (user_id, mac_address) DO UPDATE
        SET device_name = EXCLUDED.device_name
        RETURNING id, user_id as "userId", mac_address as "macAddress", device_name as "deviceName", created_at as "createdAt"`,
-      [userId, normalizedMac, deviceName]
+      [userId, canonicalMac, deviceName]
     );
 
     return res.rows[0];
   } catch (err) {
-    if (isConnectionOrAuthError(err)) {
-      activateMemoryFallback((err as Error).message);
-      return memoryTagDeviceToUser(userId, macAddress, deviceName);
+    if (shouldFallbackToMemory(err)) {
+      return memoryTagDeviceToUser(userId, canonicalMac, deviceName);
     }
     throw err;
   }
@@ -436,24 +466,26 @@ export async function removeDeviceTagFromUser(
   userId: string,
   macAddress: string
 ): Promise<boolean> {
+  if (!isUuid(userId)) return false;
+
   if (isMemoryFallbackActive()) {
     return memoryRemoveDeviceTagFromUser(userId, macAddress);
   }
 
   try {
     const pool = getDbPool();
-    const normalizedMac = macAddress.toUpperCase().trim();
+    // Compare separator-free hex so legacy "AA:BB:.." rows match canonical "AA-BB-.." input
+    const normalizedMac = normalizeMac(macAddress);
 
     const res = await pool.query(
       `DELETE FROM user_device_tags
-       WHERE user_id = $1 AND UPPER(mac_address) = $2`,
+       WHERE user_id = $1 AND UPPER(REGEXP_REPLACE(mac_address, '[^a-fA-F0-9]', '', 'g')) = $2`,
       [userId, normalizedMac]
     );
 
     return (res.rowCount ?? 0) > 0;
   } catch (err) {
-    if (isConnectionOrAuthError(err)) {
-      activateMemoryFallback((err as Error).message);
+    if (shouldFallbackToMemory(err)) {
       return memoryRemoveDeviceTagFromUser(userId, macAddress);
     }
     throw err;
@@ -483,8 +515,7 @@ export async function recordLoginAttempt(
       [userId, email, ipAddress, userAgent, loginStatus, failureReason]
     );
   } catch (err) {
-    if (isConnectionOrAuthError(err)) {
-      activateMemoryFallback((err as Error).message);
+    if (shouldFallbackToMemory(err)) {
       return memoryRecordLoginAttempt(userId, email, ipAddress, userAgent, loginStatus, failureReason);
     }
     // Never crash caller on login audit write failure
@@ -528,8 +559,7 @@ export async function getPaginatedLogins(
       totalPages,
     };
   } catch (err) {
-    if (isConnectionOrAuthError(err)) {
-      activateMemoryFallback((err as Error).message);
+    if (shouldFallbackToMemory(err)) {
       return memoryGetPaginatedLogins(page, pageSize);
     }
     throw err;
@@ -577,8 +607,7 @@ export async function saveAiInsight(
 
     return res.rows[0];
   } catch (err) {
-    if (isConnectionOrAuthError(err)) {
-      activateMemoryFallback((err as Error).message);
+    if (shouldFallbackToMemory(err)) {
       return memorySaveAiInsight(insight);
     }
     throw err;
@@ -616,8 +645,7 @@ export async function getRecentAiInsights(limit: number = 5): Promise<AiInsightR
       narration: row.narration || row.metricsSnapshot?.narration || undefined,
     }));
   } catch (err) {
-    if (isConnectionOrAuthError(err)) {
-      activateMemoryFallback((err as Error).message);
+    if (shouldFallbackToMemory(err)) {
       return memoryGetRecentAiInsights(limit);
     }
     throw err;
@@ -656,8 +684,7 @@ export async function getLatestAiInsight(): Promise<AiInsightRecord | null> {
       narration: row.narration || row.metricsSnapshot?.narration || undefined,
     };
   } catch (err) {
-    if (isConnectionOrAuthError(err)) {
-      activateMemoryFallback((err as Error).message);
+    if (shouldFallbackToMemory(err)) {
       return memoryGetLatestAiInsight();
     }
     throw err;

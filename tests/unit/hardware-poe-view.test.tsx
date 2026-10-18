@@ -51,5 +51,29 @@ describe('HardwarePoeView Component', () => {
     expect(screen.getAllByText(/Custom Core PoE Switch/i).length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText(/280.5W/i).length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText(/103.5W/i)).toBeInTheDocument();
+    expect(screen.getByText('Online')).toBeInTheDocument();
+  });
+
+  it('derives PoE switch status pills from device status', () => {
+    const base: PoeDeviceBudget = {
+      mac: 'AA-11-22-33-44-01',
+      name: 'Switch A',
+      model: 'TL-SG2210MP',
+      ip: '10.0.0.11',
+      poeRemain: 100,
+      totalPoePower: 150,
+      clientNum: 3,
+      status: 14,
+    };
+    const poeDevices = [
+      base,
+      { ...base, mac: 'AA-11-22-33-44-02', name: 'Switch B', status: 0 },
+      { ...base, mac: 'AA-11-22-33-44-03', name: 'Switch C', status: undefined as unknown as number },
+    ];
+
+    render(<HardwarePoeView poeDevices={poeDevices} />);
+    expect(screen.getAllByText('Online')).toHaveLength(1);
+    expect(screen.getAllByText('Offline')).toHaveLength(1);
+    expect(screen.getAllByText('Unknown')).toHaveLength(1);
   });
 });

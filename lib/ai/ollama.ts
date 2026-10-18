@@ -32,6 +32,85 @@ export function getOllamaDefaultModel(): string {
   return process.env.OLLAMA_MODEL || 'deepseek-r1:7b';
 }
 
+function getOllamaTimeoutMs(): number {
+  const ms = Number(process.env.OLLAMA_TIMEOUT_MS);
+  return Number.isFinite(ms) && ms > 0 ? ms : 120000;
+}
+
+/**
+ * Splits DeepSeek-R1 style output into its chain-of-thought and the remaining answer.
+ * Handles closed <think>…</think> blocks, an unclosed <think> (truncated output: runs to the end),
+ * and a bare leading "…</think>" (chat templates that open the think block in the prompt).
+ */
+export function splitThinking(raw: string): { thinking?: string; answer: string } {
+  const thoughts: string[] = [];
+  let answer = raw.replace(/<think>([\s\S]*?)<\/think>/gi, (_match, thought: string) => {
+    thoughts.push(thought.trim());
+    return '';
+  });
+
+  const unclosed = answer.search(/<think>/i);
+  if (unclosed !== -1) {
+    thoughts.push(answer.slice(unclosed + '<think>'.length).trim());
+    answer = answer.slice(0, unclosed);
+  }
+
+  const orphanClose = answer.search(/<\/think>/i);
+  if (orphanClose !== -1) {
+    thoughts.unshift(answer.slice(0, orphanClose).trim());
+    answer = answer.slice(orphanClose + '</think>'.length);
+  }
+
+  const thinking = thoughts.filter(Boolean).join('\n\n');
+  return { thinking: thinking || undefined, answer: answer.trim() };
+}
+
+/** Removes any chain-of-thought (<think> blocks, closed or not) from model output. */
+export function stripThinking(raw: string): string {
+  return splitThinking(raw).answer;
+}
+
+/**
+ * Returns the first balanced `{…}` block in `text` that parses as a JSON object, or null.
+ * Brace matching is string-aware, so braces inside JSON strings or stray prose braces don't break it.
+ */
+export function extractJsonObject<T = Record<string, unknown>>(text: string): T | null {
+  for (let start = text.indexOf('{'); start !== -1; start = text.indexOf('{', start + 1)) {
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+
+    for (let i = start; i < text.length; i++) {
+      const ch = text[i];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (ch === '\\') escaped = true;
+        else if (ch === '"') inString = false;
+        continue;
+      }
+      if (ch === '"') {
+        inString = true;
+      } else if (ch === '{') {
+        depth++;
+      } else if (ch === '}') {
+        depth--;
+        if (depth === 0) {
+          try {
+            const parsed: unknown = JSON.parse(text.slice(start, i + 1));
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+              return parsed as T;
+            }
+          } catch {
+            // Not valid JSON: try the next opening brace
+          }
+          break;
+        }
+      }
+    }
+  }
+  return null;
+}
+
 /**
  * Checks if local Ollama server is running and returns available models.
  */
@@ -79,8 +158,9 @@ export async function generateNeuralAiInsight(
   const startTime = Date.now();
 
   const controller = new AbortController();
-  // Allow up to 90s for local 7B / 14B inference on GPU/CPU
-  const timeout = setTimeout(() => controller.abort(), 90000);
+  // Local 7B / 14B inference on GPU/CPU can be slow (OLLAMA_TIMEOUT_MS, default 120s)
+  const timeoutMs = getOllamaTimeoutMs();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const res = await fetch(`${baseUrl}/api/generate`, {
@@ -92,7 +172,8 @@ export async function generateNeuralAiInsight(
         stream: false,
         options: {
           temperature: 0.3,
-          num_predict: 2048,
+          // R1 models spend many tokens inside <think>; 2048 truncated them before the JSON answer
+          num_predict: 4096,
         },
       }),
       signal: controller.signal,
@@ -114,19 +195,12 @@ export async function generateNeuralAiInsight(
     const rawResponse = data.response || '';
     const totalDurationMs = Date.now() - startTime;
 
-    // Extract DeepSeek-R1 Chain-of-Thought (<think>...</think>)
-    let thinking: string | undefined;
-    let finalResponse = rawResponse;
-
-    const thinkMatch = rawResponse.match(/<think>([\s\S]*?)<\/think>/i);
-    if (thinkMatch) {
-      thinking = thinkMatch[1].trim();
-      finalResponse = rawResponse.replace(/<think>[\s\S]*?<\/think>/i, '').trim();
-    }
+    // Extract DeepSeek-R1 Chain-of-Thought (<think>...</think>, possibly unclosed when truncated)
+    const { thinking, answer } = splitThinking(rawResponse);
 
     return {
       model: data.model || model,
-      response: finalResponse,
+      response: answer,
       thinking,
       totalDurationMs,
       evalCount: data.eval_count,
@@ -134,7 +208,7 @@ export async function generateNeuralAiInsight(
   } catch (err: unknown) {
     clearTimeout(timeout);
     if (err instanceof Error && err.name === 'AbortError') {
-      throw new Error(`Ollama neural inference timed out after 90s on model '${model}'.`);
+      throw new Error(`Ollama neural inference timed out after ${Math.round(timeoutMs / 1000)}s on model '${model}'.`);
     }
     throw err;
   }

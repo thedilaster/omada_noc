@@ -58,9 +58,10 @@ export interface ReportSummaryData {
   };
   topActiveDevices: TopActiveDevice[];
   topVolumeDevices: TopVolumeDevice[];
-  topActiveUsers: TopActiveUser[];
+  topActiveUsers: TopActiveUser[]; // always [] for non-ADMIN viewers
   rfDistribution: RfDistribution;
-  securitySummary: {
+  // Omitted for non-ADMIN viewers (operator/login audit data is admin-only)
+  securitySummary?: {
     authSuccessRate24h: number;
     totalLogins24h: number;
     failedLogins24h: number;

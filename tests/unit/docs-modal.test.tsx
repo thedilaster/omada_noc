@@ -1,6 +1,6 @@
 import React from 'react';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { DocsModal } from '@/app/components/DocsModal';
 
 describe('DocsModal Component (app/components/DocsModal.tsx)', () => {
@@ -31,6 +31,12 @@ describe('DocsModal Component (app/components/DocsModal.tsx)', () => {
     vi.clearAllMocks();
   });
 
+  afterEach(() => {
+    Object.defineProperty(navigator, 'clipboard', { value: undefined, configurable: true, writable: true });
+    Object.defineProperty(document, 'execCommand', { value: undefined, configurable: true, writable: true });
+    vi.useRealTimers();
+  });
+
   it('renders nothing when isOpen is false', () => {
     const { container } = render(<DocsModal isOpen={false} onClose={vi.fn()} />);
     expect(container).toBeEmptyDOMElement();
@@ -47,10 +53,10 @@ describe('DocsModal Component (app/components/DocsModal.tsx)', () => {
       }),
     });
 
-    Object.assign(navigator, {
-      clipboard: {
-        writeText: vi.fn().mockResolvedValue(undefined),
-      },
+    Object.defineProperty(navigator, 'clipboard', {
+      value: { writeText: vi.fn().mockResolvedValue(undefined) },
+      configurable: true,
+      writable: true,
     });
 
     const mockOnClose = vi.fn();
@@ -72,6 +78,8 @@ describe('DocsModal Component (app/components/DocsModal.tsx)', () => {
     await waitFor(() => {
       expect(screen.getByText(/Authentication guide details/i)).toBeInTheDocument();
     });
+    // Selecting a doc must not refetch the whole list
+    expect(global.fetch).toHaveBeenCalledTimes(1);
 
     // Copy markdown content
     const copyBtn = screen.getByRole('button', { name: /copy markdown/i });
@@ -113,6 +121,71 @@ describe('DocsModal Component (app/components/DocsModal.tsx)', () => {
     await waitFor(() => {
       expect(screen.getByText(/failed to access disk storage/i)).toBeInTheDocument();
     });
+  });
+
+  it('fetches once per open, keeps the selected doc, and clears a stale error on reopen', async () => {
+    global.fetch = vi.fn().mockRejectedValue(new Error('Network offline'));
+    const { rerender } = render(<DocsModal isOpen={true} onClose={vi.fn()} />);
+    await waitFor(() => {
+      expect(screen.getByText(/network offline/i)).toBeInTheDocument();
+    });
+
+    rerender(<DocsModal isOpen={false} onClose={vi.fn()} />);
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ docs: mockDocs }),
+    });
+    rerender(<DocsModal isOpen={true} onClose={vi.fn()} />);
+    expect(screen.queryByText(/network offline/i)).not.toBeInTheDocument();
+    expect(screen.getByText(/Compiling markdown documents/i)).toBeInTheDocument();
+
+    await waitFor(() => {
+      expect(screen.getByText(/Full PRD text here/i)).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText('Security & RBAC Architecture'));
+    expect(screen.getByText(/Authentication guide details/i)).toBeInTheDocument();
+
+    // Reopen: selection survives when the doc still exists
+    rerender(<DocsModal isOpen={false} onClose={vi.fn()} />);
+    rerender(<DocsModal isOpen={true} onClose={vi.fn()} />);
+    await waitFor(() => {
+      expect(screen.getByText(/Authentication guide details/i)).toBeInTheDocument();
+    });
+    expect(global.fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('copies via the legacy fallback over plain HTTP and reports failure when copying is impossible', async () => {
+    vi.useFakeTimers();
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ docs: mockDocs }),
+    });
+    const execCommand = vi.fn().mockReturnValue(true);
+    Object.defineProperty(document, 'execCommand', { value: execCommand, configurable: true, writable: true });
+
+    render(<DocsModal isOpen={true} onClose={vi.fn()} />);
+    await act(async () => {
+      await vi.runAllTimersAsync();
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /copy markdown/i }));
+    });
+    expect(execCommand).toHaveBeenCalledWith('copy');
+    expect(screen.getByText('Copied')).toBeInTheDocument();
+
+    await act(async () => {
+      vi.advanceTimersByTime(2000);
+    });
+    expect(screen.getByText('Copy Markdown')).toBeInTheDocument();
+
+    execCommand.mockReturnValue(false);
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /copy markdown/i }));
+    });
+    expect(screen.getByText('Copy failed')).toBeInTheDocument();
   });
 
   it('handles network throw error gracefully', async () => {

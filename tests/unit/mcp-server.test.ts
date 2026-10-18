@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { server, omadaClient, startMcpServer } from '@/mcp/server';
 import * as dbQueries from '@/lib/db/queries';
+import { activateMemoryFallback, resetMemoryFallback } from '@/lib/db/pool';
 
 describe('MCP Server Bridge', () => {
   beforeEach(() => {
@@ -269,6 +270,21 @@ describe('MCP Server Bridge', () => {
       expect(result.content[0].text).toContain('Main Gateway');
     });
 
+    it('derives Connected/Offline from isDeviceOnline (statusCategory first, v5 codes 14-17)', async () => {
+      vi.spyOn(omadaClient, 'getDevices').mockResolvedValue([
+        { mac: 'A', name: 'Wireless-Mesh-AP', type: 'ap', model: 'EAP', ip: '1', status: 15 },
+        { mac: 'B', name: 'Migrating-Down', type: 'ap', model: 'EAP', ip: '2', status: 1 },
+        { mac: 'C', name: 'Category-Online', type: 'switch', model: 'SG', ip: '3', status: 0, statusCategory: 1 },
+      ] as any);
+      const toolHandler = (server as any)._registeredTools?.get_network_devices?.handler;
+
+      const text: string = (await toolHandler({ device_type: 'all' })).content[0].text;
+      const statusOf = (name: string) => text.split(name)[1].split('**Status:** ')[1].split(' |')[0];
+      expect(statusOf('Wireless-Mesh-AP')).toBe('Connected ✅');
+      expect(statusOf('Migrating-Down')).toBe('Isolated/Offline ⚠️');
+      expect(statusOf('Category-Online')).toBe('Connected ✅');
+    });
+
     it('handles empty results and returns descriptive message', async () => {
       vi.spyOn(omadaClient, 'getDevices').mockResolvedValue([]);
       const toolHandler = (server as any)._registeredTools?.get_network_devices?.handler;
@@ -377,6 +393,29 @@ describe('MCP Server Bridge', () => {
   });
 
   describe('Tool: get_audit_history', () => {
+    it('bounds limit to an integer between 1 and 100', () => {
+      const schema = (server as any)._registeredTools?.get_audit_history?.inputSchema;
+      expect(schema.safeParse({ limit: 5 }).success).toBe(true);
+      expect(schema.safeParse({}).success).toBe(true);
+      expect(schema.safeParse({ limit: -1 }).success).toBe(false);
+      expect(schema.safeParse({ limit: 0 }).success).toBe(false);
+      expect(schema.safeParse({ limit: 2.5 }).success).toBe(false);
+      expect(schema.safeParse({ limit: 101 }).success).toBe(false);
+    });
+
+    it('explains that history needs PostgreSQL when only the in-memory fallback is available', async () => {
+      vi.spyOn(dbQueries, 'getRecentAiInsights').mockResolvedValue([]);
+      activateMemoryFallback();
+      try {
+        const toolHandler = (server as any)._registeredTools?.get_audit_history?.handler;
+        const result = await toolHandler({ limit: 5 });
+        expect(result.content[0].text).toContain('Audit history requires the PostgreSQL database');
+        expect(result.content[0].text).not.toContain('No prior AI network audit history');
+      } finally {
+        resetMemoryFallback();
+      }
+    });
+
     it('returns empty notice when no audits exist', async () => {
       vi.spyOn(dbQueries, 'getRecentAiInsights').mockResolvedValue([]);
       const toolHandler = (server as any)._registeredTools?.get_audit_history?.handler;

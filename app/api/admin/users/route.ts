@@ -1,14 +1,12 @@
 import { NextResponse } from 'next/server';
-import { getCurrentSession } from '@/lib/auth/session';
+import { requireAdmin } from '@/lib/auth/guards';
 import { listAllUsersWithDetails, createUser, findUserByEmailOrUsername } from '@/lib/db/queries';
 import { hashPassword } from '@/lib/auth/password';
 
 export async function GET() {
   try {
-    const session = await getCurrentSession();
-    if (!session || session.role !== 'ADMIN') {
-      return NextResponse.json({ error: 'Forbidden: Admin access required' }, { status: 403 });
-    }
+    const guard = await requireAdmin();
+    if (!guard.ok) return guard.response;
 
     const users = await listAllUsersWithDetails();
     return NextResponse.json({ users });
@@ -20,10 +18,8 @@ export async function GET() {
 
 export async function POST(request: Request) {
   try {
-    const session = await getCurrentSession();
-    if (!session || session.role !== 'ADMIN') {
-      return NextResponse.json({ error: 'Forbidden: Admin access required' }, { status: 403 });
-    }
+    const guard = await requireAdmin();
+    if (!guard.ok) return guard.response;
 
     const body = await request.json();
     const { username, email, password, role, fullName } = body;

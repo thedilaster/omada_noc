@@ -2,8 +2,9 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { OmadaClient } from '../lib/omada/client';
-import { formatBytes, formatRate, formatUptime, formatMac } from '../lib/omada/formatters';
+import { formatBytes, formatRate, formatUptime, formatMac, isDeviceOnline } from '../lib/omada/formatters';
 import { getRecentAiInsights } from '../lib/db/queries';
+import { isMemoryFallbackActive } from '../lib/db/pool';
 
 // Initialize the Omada API client from environment variables
 export const omadaClient = new OmadaClient();
@@ -215,7 +216,7 @@ server.tool(
       const deviceListText = devices
         .map((d, idx) => {
           const typeIcon = d.type === 'ap' ? '📶 Access Point' : d.type === 'switch' ? '🔌 Switch' : '🛡️ Gateway';
-          const statusText = d.status === 14 || d.status === 1 ? 'Connected ✅' : 'Isolated/Offline ⚠️';
+          const statusText = isDeviceOnline(d) ? 'Connected ✅' : 'Isolated/Offline ⚠️';
           const cpu = d.cpuUtil !== undefined ? `${d.cpuUtil}%` : 'N/A';
           const mem = d.memUtil !== undefined ? `${d.memUtil}%` : 'N/A';
           const clients = d.clientNum !== undefined ? `${d.clientNum} client(s)` : 'N/A';
@@ -381,11 +382,29 @@ server.tool(
   'get_audit_history',
   'Retrieve the chronological history and trajectory of previous AI network health audits, score trends, resolved issues, and persisting warnings.',
   {
-    limit: z.number().optional().describe('Maximum number of past audit records to retrieve (default: 5).'),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(100)
+      .optional()
+      .describe('Maximum number of past audit records to retrieve (1-100, default: 5).'),
   },
   async ({ limit = 5 }) => {
     try {
       const history = await getRecentAiInsights(limit);
+
+      // Without PostgreSQL the MCP process only has its own empty in-memory store
+      if (history.length === 0 && isMemoryFallbackActive()) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: '⚠️ **Audit history requires the PostgreSQL database.** The database is unavailable to the MCP server (check DATABASE_URL), so saved audits from the dashboard cannot be read.',
+            },
+          ],
+        };
+      }
 
       if (history.length === 0) {
         return {

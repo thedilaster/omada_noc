@@ -3,6 +3,26 @@
 import React, { useState } from 'react';
 import { OmadaTopologyNode, OmadaDeviceItem, OmadaClientDevice } from '@/types/omada';
 import { formatMac } from '@/lib/omada/formatters';
+import { getDeviceStatus } from './uiHelpers';
+
+interface TopologyCardNode {
+  type?: string;
+  name: string;
+  mac: string;
+  model: string;
+  ip?: string;
+  clientCount?: number;
+  uplink?: string;
+  poeWatts?: string;
+  status?: number;
+  statusCategory?: number;
+}
+
+const STATUS_BADGE = {
+  online: { label: 'Online', text: 'text-emerald-400', dot: 'bg-emerald-400 animate-pulse' },
+  offline: { label: 'Offline', text: 'text-rose-400', dot: 'bg-rose-500' },
+  unknown: { label: 'Unknown', text: 'text-amber-400', dot: 'bg-amber-400' },
+} as const;
 
 interface TopologyViewProps {
   topology?: OmadaTopologyNode[];
@@ -16,17 +36,7 @@ export default function TopologyView({
   devices = [],
   siteName = 'The Farm',
 }: TopologyViewProps) {
-  const [selectedNode, setSelectedNode] = useState<{
-    type: string;
-    name: string;
-    mac: string;
-    model: string;
-    ip?: string;
-    clientCount?: number;
-    uplink?: string;
-    poeWatts?: string;
-    status?: number;
-  } | null>(null);
+  const [selectedNode, setSelectedNode] = useState<TopologyCardNode | null>(null);
 
   const [activeLayerFilter, setActiveLayerFilter] = useState<'all' | 'gateway' | 'switch' | 'ap'>('all');
 
@@ -48,7 +58,7 @@ export default function TopologyView({
   const customFlatNodes = topology.length > 0 ? flattenTopology(topology) : [];
 
   // Map real devices to topology nodes if explicit topology tree not provided
-  const flatNodes = customFlatNodes.length > 0
+  const flatNodes: TopologyCardNode[] = customFlatNodes.length > 0
     ? customFlatNodes
     : devices.map((d) => ({
         type: d.type || 'ap',
@@ -57,6 +67,7 @@ export default function TopologyView({
         model: d.model,
         ip: d.ip,
         status: d.status,
+        statusCategory: (d as { statusCategory?: number }).statusCategory,
         clientCount: d.clientNum ?? 0,
         uplink: 'Auto-Negotiated Uplink',
         poeWatts: d.totalPoePower ? `${(d.totalPoePower - (d.poeRemain ?? 0)).toFixed(1)}W` : undefined,
@@ -84,8 +95,8 @@ export default function TopologyView({
     (n) => !['gateway', 'switch', 'ap'].includes(n.type?.toLowerCase() || '')
   );
 
-  const getNodeColor = (type: string) => {
-    switch (type.toLowerCase()) {
+  const getNodeColor = (type?: string) => {
+    switch ((type || '').toLowerCase()) {
       case 'gateway':
         return {
           bg: 'bg-purple-950/70',
@@ -121,19 +132,10 @@ export default function TopologyView({
     }
   };
 
-  const renderCard = (node: {
-    type: string;
-    name: string;
-    mac: string;
-    model: string;
-    ip?: string;
-    clientCount?: number;
-    uplink?: string;
-    poeWatts?: string;
-    status?: number;
-  }) => {
+  const renderCard = (node: TopologyCardNode) => {
     const style = getNodeColor(node.type);
     const isSelected = selectedNode?.mac === node.mac;
+    const statusBadge = STATUS_BADGE[getDeviceStatus(node)];
 
     return (
       <div
@@ -149,12 +151,12 @@ export default function TopologyView({
           <div className="flex items-center gap-1.5">
             <span className="text-base">{style.icon}</span>
             <span className={`px-2 py-0.5 rounded-full text-[10px] font-mono font-bold uppercase border ${style.badge}`}>
-              {node.type}
+              {node.type || 'unknown'}
             </span>
           </div>
-          <div className="flex items-center gap-1 text-[11px] font-mono text-emerald-400">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-            <span>Online</span>
+          <div className={`flex items-center gap-1 text-[11px] font-mono ${statusBadge.text}`}>
+            <span className={`w-1.5 h-1.5 rounded-full ${statusBadge.dot}`} />
+            <span>{statusBadge.label}</span>
           </div>
         </div>
 

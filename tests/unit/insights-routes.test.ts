@@ -8,6 +8,12 @@ import * as dbQueries from '@/lib/db/queries';
 describe('Admin AI Insights API Routes', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // requireAdmin() authorizes against the stored role, not the JWT claim
+    vi.spyOn(dbQueries, 'findUserById').mockImplementation(async (id: string) =>
+      id === 'u-admin' || id === 'u-user'
+        ? { id, username: id, email: `${id}@test.com`, role: id === 'u-admin' ? 'ADMIN' : 'USER', createdAt: '', updatedAt: '' }
+        : null
+    );
   });
 
   describe('POST /api/admin/insights/run', () => {
@@ -137,6 +143,25 @@ describe('Admin AI Insights API Routes', () => {
       expect(res.status).toBe(200);
       const json = await res.json();
       expect(json.history.length).toBe(1);
+      expect(dbQueries.getRecentAiInsights).toHaveBeenLastCalledWith(5);
+
+      // Non-numeric limits fall back to the default; huge limits are clamped
+      await historyInsightHandler(new Request('http://localhost/api/admin/insights/history?limit=abc'));
+      expect(dbQueries.getRecentAiInsights).toHaveBeenLastCalledWith(10);
+      await historyInsightHandler(new Request('http://localhost/api/admin/insights/history?limit=999999'));
+      expect(dbQueries.getRecentAiInsights).toHaveBeenLastCalledWith(100);
+    });
+
+    it('rejects a demoted admin whose JWT still claims ADMIN', async () => {
+      vi.spyOn(sessionModule, 'getCurrentSession').mockResolvedValue({
+        userId: 'u-user',
+        username: 'formerly-admin',
+        email: 'user@test.com',
+        role: 'ADMIN',
+        lastActive: Date.now(),
+      });
+      const res = await historyInsightHandler(new Request('http://localhost/api/admin/insights/history'));
+      expect(res.status).toBe(403);
     });
 
     it('handles unexpected exceptions and returns 500', async () => {

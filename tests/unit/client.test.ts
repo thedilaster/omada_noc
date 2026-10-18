@@ -1,5 +1,15 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
-import { OmadaClient, getOmadaClient } from '@/lib/omada/client';
+import { OmadaClient, getOmadaClient, isLoginRequiredErrorCode, OmadaNetworkError } from '@/lib/omada/client';
+
+// The client has no default credentials, so give every test in this file a configured account
+beforeEach(() => {
+  vi.stubEnv('OMADA_USER', 'test-user');
+  vi.stubEnv('OMADA_PASS', 'test-pass');
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
 
 describe('OmadaClient', () => {
   const originalFetch = global.fetch;
@@ -10,6 +20,39 @@ describe('OmadaClient', () => {
 
   afterEach(() => {
     global.fetch = originalFetch;
+  });
+
+  describe('credential safety', () => {
+    it('refuses to log in without configured credentials and makes no request', async () => {
+      vi.stubEnv('OMADA_USER', '');
+      vi.stubEnv('OMADA_PASS', '');
+      const mockFetch = vi.fn();
+      global.fetch = mockFetch;
+      const client = new OmadaClient({ baseUrl: 'https://127.0.0.1' });
+
+      await expect(client.login()).rejects.toThrow('Omada credentials are not configured');
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('backs off after the controller rejects credentials instead of retrying every poll', async () => {
+      const mockFetch = vi.fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ errorCode: 0, result: { omadacId: 'cid' } }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          headers: new Headers(),
+          json: async () => ({ errorCode: -30109, msg: 'Invalid username or password.' }),
+        });
+      global.fetch = mockFetch;
+      const client = new OmadaClient({ baseUrl: 'https://127.0.0.1' });
+
+      await expect(client.login()).rejects.toThrow('Invalid username or password.');
+      const callsAfterFirstAttempt = mockFetch.mock.calls.length;
+      await expect(client.login(true)).rejects.toThrow('Invalid username or password.');
+      expect(mockFetch.mock.calls.length).toBe(callsAfterFirstAttempt);
+    });
   });
 
   describe('constructor & configuration', () => {
@@ -337,7 +380,30 @@ describe('OmadaClient', () => {
       expect(sites[0].siteId).toBe('userSite123');
     });
 
-    it('falls back to siteNameOrId when site list is completely empty', async () => {
+    it('falls back to siteNameOrId (uncached) when no site list is available', async () => {
+      const mockFetch = vi.fn().mockImplementation(async (url: string) => {
+        if (url.endsWith('/api/info')) {
+          return { ok: true, status: 200, json: async () => ({ errorCode: 0, result: { omadacId: 'omada-123' } }) };
+        }
+        if (url.endsWith('/api/v2/login')) {
+          return { ok: true, status: 200, headers: { get: () => 'TPEAP_SESSIONID=sess_123;' }, json: async () => ({ errorCode: 0, result: { token: 'token-123' } }) };
+        }
+        return { ok: true, status: 200, json: async () => ({ errorCode: -1005, msg: 'Permission denied' }) };
+      });
+
+      global.fetch = mockFetch;
+
+      const client = new OmadaClient({ siteNameOrId: 'fallback-site-id' });
+      const resolvedId = await client.getResolvedSiteId();
+      expect(resolvedId).toBe('fallback-site-id');
+
+      // Not cached: the next call asks the controller again
+      const callsBefore = mockFetch.mock.calls.length;
+      await client.getResolvedSiteId();
+      expect(mockFetch.mock.calls.length).toBeGreaterThan(callsBefore);
+    });
+
+    it('propagates network errors instead of guessing a site', async () => {
       const mockFetch = vi.fn().mockImplementation(async (url: string) => {
         if (url.endsWith('/api/info')) {
           return { ok: true, status: 200, json: async () => ({ errorCode: 0, result: { omadacId: 'omada-123' } }) };
@@ -351,8 +417,7 @@ describe('OmadaClient', () => {
       global.fetch = mockFetch;
 
       const client = new OmadaClient({ siteNameOrId: 'fallback-site-id' });
-      const resolvedId = await client.getResolvedSiteId();
-      expect(resolvedId).toBe('fallback-site-id');
+      await expect(client.getResolvedSiteId()).rejects.toThrow(/Network error/);
     });
   });
 
@@ -645,7 +710,7 @@ describe('OmadaClient', () => {
         type: 'switch',
         model: 'SG2218P',
         ip: '192.168.100.3',
-        status: 15, // isolated
+        status: 40, // isolated
         clientNum: 5,
         cpuUtil: 12,
         memUtil: 45,
@@ -1150,6 +1215,583 @@ describe('OmadaClient', () => {
       const instance1 = getOmadaClient();
       const instance2 = getOmadaClient();
       expect(instance1).toBe(instance2);
+    });
+  });
+});
+
+describe('OmadaClient hardening (TLS, re-login, timeouts, pagination, sites, WAN)', () => {
+  const originalFetch = global.fetch;
+  const savedEnv = {
+    tls: process.env.NODE_TLS_REJECT_UNAUTHORIZED,
+    insecure: process.env.OMADA_ALLOW_INSECURE_SSL,
+    timeout: process.env.OMADA_TIMEOUT_MS,
+  };
+
+  const restoreEnv = (key: string, value: string | undefined) => {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  };
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    restoreEnv('NODE_TLS_REJECT_UNAUTHORIZED', savedEnv.tls);
+    restoreEnv('OMADA_ALLOW_INSECURE_SSL', savedEnv.insecure);
+    restoreEnv('OMADA_TIMEOUT_MS', savedEnv.timeout);
+    vi.restoreAllMocks();
+  });
+
+  const jsonRes = (body: unknown, extra: Record<string, unknown> = {}) => ({
+    ok: true,
+    status: 200,
+    json: async () => body,
+    ...extra,
+  });
+
+  /** Mock controller: /api/info + /login (token-N per login), site list, then custom routes, else 404 */
+  const mockController = (routes: (url: string, init: any) => unknown = () => undefined) => {
+    let logins = 0;
+    const fetchMock = vi.fn(async (url: string, init?: any) => {
+      if (url.endsWith('/api/info')) return jsonRes({ errorCode: 0, result: { omadacId: 'cid' } });
+      if (url.endsWith('/api/v2/login')) {
+        logins++;
+        const n = logins;
+        return jsonRes({ errorCode: 0, result: { token: `token-${n}` } }, { headers: { get: () => `TPOMADA_SESSIONID=s${n};` } });
+      }
+      const custom = await routes(url, init);
+      if (custom !== undefined) return custom;
+      if (url.includes('/api/v2/sites?')) return jsonRes({ errorCode: 0, result: [{ siteId: 'site-1', name: 'Default' }] });
+      return { ok: false, status: 404, statusText: 'Not Found' };
+    });
+    global.fetch = fetchMock as any;
+    return { fetchMock, logins: () => logins };
+  };
+
+  const newClient = () => new OmadaClient({ baseUrl: 'https://ctrl.test:8043' });
+  const tokenOf = (init: any) => init?.headers?.['Csrf-Token'];
+
+  describe('TLS verification (opt-in only)', () => {
+    it('keeps certificate verification on unless OMADA_ALLOW_INSECURE_SSL is exactly "true"', () => {
+      delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+      delete process.env.OMADA_ALLOW_INSECURE_SSL;
+      new OmadaClient();
+      expect(process.env.NODE_TLS_REJECT_UNAUTHORIZED).toBeUndefined();
+
+      process.env.OMADA_ALLOW_INSECURE_SSL = 'yes';
+      new OmadaClient();
+      expect(process.env.NODE_TLS_REJECT_UNAUTHORIZED).toBeUndefined();
+
+      process.env.OMADA_ALLOW_INSECURE_SSL = 'true';
+      new OmadaClient({ allowInsecureSsl: false });
+      expect(process.env.NODE_TLS_REJECT_UNAUTHORIZED).toBeUndefined();
+
+      new OmadaClient();
+      expect(process.env.NODE_TLS_REJECT_UNAUTHORIZED).toBe('0');
+    });
+
+    it('honours an explicit allowInsecureSsl: true config', () => {
+      delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+      delete process.env.OMADA_ALLOW_INSECURE_SSL;
+      new OmadaClient({ allowInsecureSsl: true });
+      expect(process.env.NODE_TLS_REJECT_UNAUTHORIZED).toBe('0');
+    });
+  });
+
+  describe('isLoginRequiredErrorCode', () => {
+    it('recognises session codes and the -1200..-1299 login-required range', () => {
+      for (const code of [-30000, -30001, -39000, -1000, -1200, -1250, -1299]) {
+        expect(isLoginRequiredErrorCode(code)).toBe(true);
+      }
+      for (const code of [0, -1, -1199, -1300, -1001]) {
+        expect(isLoginRequiredErrorCode(code)).toBe(false);
+      }
+      expect(isLoginRequiredErrorCode(undefined)).toBe(false);
+    });
+  });
+
+  describe('re-login rules', () => {
+    it('re-logs in once on a -12xx "login required" errorCode', async () => {
+      let calls = 0;
+      const { logins } = mockController((url) => {
+        if (url.includes('/devices')) {
+          calls++;
+          return calls === 1
+            ? jsonRes({ errorCode: -1201, msg: 'Login required' })
+            : jsonRes({ errorCode: 0, result: [{ mac: 'A', name: 'AP', type: 'ap', status: 14 }] });
+        }
+      });
+      const client = newClient();
+      const devices = await client.getDevices();
+      expect(devices).toHaveLength(1);
+      expect(logins()).toBe(2);
+    });
+
+    it('re-logs in on HTTP 302 and on a redirect to the login page', async () => {
+      let calls = 0;
+      const { logins } = mockController((url) => {
+        if (url.includes('/devices')) {
+          calls++;
+          if (calls === 1) return { ok: false, status: 302, statusText: 'Found' };
+          if (calls === 3) return jsonRes('<html></html>', { redirected: true, url: 'https://ctrl.test:8043/cid/login' });
+          return jsonRes({ errorCode: 0, result: [] });
+        }
+      });
+      const client = newClient();
+      await client.getDevices();
+      await client.getDevices();
+      expect(logins()).toBe(3);
+    });
+
+    it('does not re-login on 404 or 5xx responses', async () => {
+      const { logins } = mockController((url) => {
+        if (url.includes('/devices')) return { ok: false, status: 500, statusText: 'Server Error' };
+      });
+      const client = newClient();
+      await expect(client.getDevices()).rejects.toThrow(/Omada API request failed: 500/);
+      expect(logins()).toBe(1);
+    });
+
+    it('throws when the controller still rejects the session after re-login', async () => {
+      const { logins } = mockController((url) => {
+        if (url.includes('/devices')) return { ok: false, status: 401, statusText: 'Unauthorized' };
+      });
+      const client = newClient();
+      await expect(client.getDevices()).rejects.toThrow(/rejected the session after re-login \(HTTP 401\)/);
+      expect(logins()).toBe(2);
+    });
+
+    it('surfaces a login-required errorCode that persists after re-login as an API error', async () => {
+      mockController((url) => {
+        if (url.includes('/clients')) return jsonRes({ errorCode: -30000, msg: 'Session expired' });
+      });
+      const client = newClient();
+      await expect(client.getActiveClients()).rejects.toThrow(/Failed to retrieve clients: Session expired \(code -30000\)/);
+    });
+
+    it('performs a single re-login for many parallel requests that hit an expired session', async () => {
+      const { logins } = mockController((url, init) => {
+        if (url.includes('/devices') || url.includes('/clients') || url.includes('/topology')) {
+          if (tokenOf(init) === 'token-1') return { ok: false, status: 401, statusText: 'Unauthorized' };
+          return jsonRes({ errorCode: 0, result: [] });
+        }
+      });
+      const client = newClient();
+      await client.login();
+      await client.getResolvedSiteId();
+
+      await Promise.all([
+        client.getDevices(),
+        client.getDevices('ap'),
+        client.getActiveClients(),
+        client.getActiveClients(),
+        client.getTopology(),
+        client.getTopology(),
+        client.getDevices('switch'),
+        client.getDevices('gateway'),
+      ]);
+
+      expect(logins()).toBe(2);
+    });
+
+    it('skips re-login when the token already changed since the failing request was sent', async () => {
+      let releaseClients: () => void = () => {};
+      const clientsGate = new Promise<void>((resolve) => {
+        releaseClients = resolve;
+      });
+
+      const { logins } = mockController(async (url, init) => {
+        if (url.includes('/devices')) {
+          if (tokenOf(init) === 'token-1') return { ok: false, status: 401, statusText: 'Unauthorized' };
+          return jsonRes({ errorCode: 0, result: [] });
+        }
+        if (url.includes('/clients')) {
+          if (tokenOf(init) === 'token-1') {
+            await clientsGate; // answer only after the other request finished its re-login
+            return { ok: false, status: 401, statusText: 'Unauthorized' };
+          }
+          return jsonRes({ errorCode: 0, result: [{ mac: 'C1', ip: '1.1.1.1', wireless: false }] });
+        }
+      });
+
+      const client = newClient();
+      await client.login();
+      await client.getResolvedSiteId();
+
+      const clientsPromise = client.getActiveClients();
+      await client.getDevices(); // 401 -> re-login (token-2) -> retry ok
+      releaseClients();
+      const clients = await clientsPromise;
+
+      expect(clients).toHaveLength(1);
+      expect(logins()).toBe(2);
+    });
+
+    it('logs in again when a previous forced re-login failed', async () => {
+      let loginAttempts = 0;
+      const fetchMock = vi.fn(async (url: string, init?: any) => {
+        if (url.endsWith('/api/info')) return jsonRes({ errorCode: 0, result: { omadacId: 'cid' } });
+        if (url.endsWith('/api/v2/login')) {
+          loginAttempts++;
+          if (loginAttempts === 2) return { ok: false, status: 503, statusText: 'Unavailable' };
+          return jsonRes({ errorCode: 0, result: { token: `token-${loginAttempts}` } }, { headers: { get: () => 'S=1;' } });
+        }
+        if (url.includes('/api/v2/sites?')) return jsonRes({ errorCode: 0, result: [{ siteId: 'site-1', name: 'Default' }] });
+        if (tokenOf(init) === 'token-1') return { ok: false, status: 401, statusText: 'Unauthorized' };
+        return jsonRes({ errorCode: 0, result: [] });
+      });
+      global.fetch = fetchMock as any;
+
+      const client = newClient();
+      await client.getResolvedSiteId();
+      await expect(client.getDevices()).rejects.toThrow(/Omada Login HTTP error: 503/);
+      await expect(client.getDevices()).resolves.toEqual([]);
+      expect(loginAttempts).toBe(3);
+    });
+  });
+
+  describe('timeouts and network errors', () => {
+    it('passes an AbortSignal.timeout to every controller fetch, honouring OMADA_TIMEOUT_MS', async () => {
+      const timeoutSpy = vi.spyOn(AbortSignal, 'timeout');
+      process.env.OMADA_TIMEOUT_MS = '1234';
+      const { fetchMock } = mockController();
+      const client = newClient();
+      await client.login();
+      expect(timeoutSpy).toHaveBeenCalledWith(1234);
+      expect(fetchMock.mock.calls.every(([, init]) => init?.signal instanceof AbortSignal)).toBe(true);
+
+      process.env.OMADA_TIMEOUT_MS = 'not-a-number';
+      await client.login(true);
+      expect(timeoutSpy).toHaveBeenLastCalledWith(8000);
+    });
+
+    it('fails fast on a timeout without probing fallback ports', async () => {
+      const timeoutErr = Object.assign(new Error('The operation timed out.'), { name: 'TimeoutError' });
+      const fetchMock = vi.fn().mockRejectedValue(timeoutErr);
+      global.fetch = fetchMock;
+
+      const client = new OmadaClient({ baseUrl: 'https://10.0.0.9' });
+      await expect(client.login()).rejects.toThrow(/did not respond within 8000ms/);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      const status = await new OmadaClient({ baseUrl: 'https://10.0.0.9' }).getNetworkStatus();
+      expect(status.controllerOnline).toBe(false);
+    });
+
+    it('stops probing fallback ports once a candidate port times out', async () => {
+      const fetchMock = vi.fn().mockImplementation(async (url: string) => {
+        if (url === 'https://10.0.0.9/api/info') throw new TypeError('fetch failed');
+        throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+      });
+      global.fetch = fetchMock;
+
+      const client = new OmadaClient({ baseUrl: 'https://10.0.0.9' });
+      await expect(client.login()).rejects.toBeInstanceOf(OmadaNetworkError);
+      expect(fetchMock).toHaveBeenCalledTimes(2); // :443 default + :8043, never the :443 retry
+    });
+
+    it('does not cycle through client endpoint fallbacks on network errors', async () => {
+      const { fetchMock } = mockController((url) => {
+        if (url.includes('/clients')) throw new TypeError('fetch failed');
+      });
+      const client = newClient();
+      await expect(client.getActiveClients()).rejects.toBeInstanceOf(OmadaNetworkError);
+      expect(fetchMock.mock.calls.filter(([u]) => String(u).includes('/clients'))).toHaveLength(1);
+    });
+
+    it('falls back to the unfiltered client list only when filters.active is unsupported, dropping inactive entries', async () => {
+      const { fetchMock } = mockController((url) => {
+        if (url.includes('/clients') && url.includes('filters.active=true')) return { ok: false, status: 404, statusText: 'Not Found' };
+        if (url.includes('/clients')) {
+          return jsonRes({
+            errorCode: 0,
+            result: { totalRows: 2, data: [{ mac: 'ON', active: true }, { mac: 'OFF', active: false }] },
+          });
+        }
+      });
+      const client = newClient();
+      const clients = await client.getActiveClients();
+      expect(clients.map((c) => c.mac)).toEqual(['ON']);
+      expect(fetchMock.mock.calls.some(([u]) => String(u).includes('/insight/'))).toBe(false);
+    });
+  });
+
+  describe('pagination', () => {
+    it('reads every client page until totalRows is reached', async () => {
+      const total = 2500;
+      const { fetchMock } = mockController((url) => {
+        if (url.includes('/clients')) {
+          const page = Number(new URL(url).searchParams.get('currentPage'));
+          const start = (page - 1) * 1000;
+          const count = Math.max(0, Math.min(1000, total - start));
+          const data = Array.from({ length: count }, (_, i) => ({ mac: `M${start + i}`, wireless: false }));
+          return jsonRes({ errorCode: 0, result: { totalRows: total, currentPage: page, data } });
+        }
+      });
+      const client = newClient();
+      const clients = await client.getActiveClients();
+      expect(clients).toHaveLength(total);
+      expect(fetchMock.mock.calls.filter(([u]) => String(u).includes('/clients'))).toHaveLength(3);
+    });
+
+    it('pages devices without totalRows until a short page, and fails on a later page error', async () => {
+      let mode: 'short' | 'error' = 'short';
+      mockController((url) => {
+        if (url.includes('/devices')) {
+          const page = Number(new URL(url).searchParams.get('currentPage'));
+          if (page === 1) {
+            return jsonRes({ errorCode: 0, result: { data: Array.from({ length: 100 }, (_, i) => ({ mac: `D${i}`, type: 'ap', status: 14 })) } });
+          }
+          if (mode === 'error') return jsonRes({ errorCode: -1, msg: 'Busy' });
+          return jsonRes({ errorCode: 0, result: { data: [{ mac: 'LAST', type: 'switch', status: 14 }] } });
+        }
+      });
+      const client = newClient();
+      expect(await client.getDevices()).toHaveLength(101);
+
+      mode = 'error';
+      await expect(client.getDevices()).rejects.toThrow(/Failed to retrieve devices: Busy/);
+    });
+
+    it('stops at the page cap and warns', async () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const { fetchMock } = mockController((url) => {
+        if (url.includes('/devices')) {
+          return jsonRes({ errorCode: 0, result: { totalRows: 1_000_000, data: Array.from({ length: 100 }, () => ({ mac: 'X', status: 14 })) } });
+        }
+      });
+      const client = newClient();
+      const devices = await client.getDevices();
+      expect(devices).toHaveLength(2000);
+      expect(fetchMock.mock.calls.filter(([u]) => String(u).includes('/devices'))).toHaveLength(20);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('Stopped paging after 20 pages'));
+    });
+  });
+
+  describe('site resolution', () => {
+    it('falls back to users/current privilege.sites when /sites returns a non-zero errorCode', async () => {
+      mockController((url) => {
+        if (url.includes('/api/v2/sites?')) return jsonRes({ errorCode: -1005, msg: 'No permission' });
+        if (url.includes('/users/current')) {
+          return jsonRes({ errorCode: 0, result: { privilege: { sites: [{ id: 'priv-site', name: 'The Site' }] } } });
+        }
+      });
+      const client = new OmadaClient({ baseUrl: 'https://ctrl.test:8043', siteNameOrId: 'the site' });
+      expect(await client.getResolvedSiteId()).toBe('priv-site');
+    });
+
+    it('returns [] when users/current fails at the HTTP level, but propagates its network errors', async () => {
+      let usersMode: 'http' | 'network' = 'http';
+      mockController((url) => {
+        if (url.includes('/api/v2/sites?')) return jsonRes({ errorCode: 0, result: [] });
+        if (url.includes('/users/current')) {
+          if (usersMode === 'network') throw new TypeError('fetch failed');
+          return { ok: false, status: 500, statusText: 'Error' };
+        }
+      });
+      const client = newClient();
+      expect(await client.getSites()).toEqual([]);
+
+      usersMode = 'network';
+      await expect(client.getSites()).rejects.toBeInstanceOf(OmadaNetworkError);
+    });
+
+    it('warns with the available site names when OMADA_SITE matches nothing, and ignores sites without an ID', async () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      mockController((url) => {
+        if (url.includes('/api/v2/sites?')) {
+          return jsonRes({ errorCode: 0, result: [{ name: 'Broken' }, { siteId: 's-a', name: 'Alpha' }, { siteId: 's-b', name: 'Beta' }] });
+        }
+      });
+      const client = new OmadaClient({ baseUrl: 'https://ctrl.test:8043', siteNameOrId: 'Gamma' });
+      expect(await client.getResolvedSiteId()).toBe('s-a');
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('Available sites: Alpha, Beta'));
+    });
+  });
+
+  describe('health audit resilience & device status', () => {
+    it('produces the controller-offline alert instead of throwing when the controller is unreachable', async () => {
+      global.fetch = vi.fn().mockRejectedValue(new TypeError('fetch failed'));
+      const client = newClient();
+      const audit = await client.getNetworkHealthAudit();
+      expect(audit.alerts).toContain('Omada Controller is offline or unreachable.');
+      expect(audit.controllerStatus).toContain('Offline');
+      expect(audit.totalDevices).toBe(0);
+    });
+
+    it('warns when only the device inventory fails and treats statusCategory as authoritative', async () => {
+      let devicesFail = true;
+      mockController((url) => {
+        if (url.includes('/clients')) return jsonRes({ errorCode: 0, result: [] });
+        if (url.includes('/devices')) {
+          if (devicesFail) return { ok: false, status: 500, statusText: 'Error' };
+          return jsonRes({
+            errorCode: 0,
+            result: [
+              { mac: 'A', name: 'Cat-Online', type: 'ap', status: 0, statusCategory: 1 },
+              { mac: 'B', name: 'Heartbeat', type: 'ap', status: 30 },
+            ],
+          });
+        }
+      });
+      const client = newClient();
+      const degraded = await client.getNetworkHealthAudit();
+      expect(degraded.warnings[0]).toMatch(/device inventory could not be retrieved/);
+
+      devicesFail = false;
+      const audit = await client.getNetworkHealthAudit();
+      expect(audit.alerts).toEqual(['1 infrastructure device(s) are isolated or offline: Heartbeat']);
+    });
+  });
+
+  describe('defensive fallbacks', () => {
+    it('returns empty collections when optional endpoints fail or return unexpected shapes', async () => {
+      mockController((url) => {
+        if (url.includes('/topology')) return jsonRes({ errorCode: 0, result: { data: [{ type: 'ap', name: 'T', mac: 'T1', model: 'EAP', statusCategory: 1 }] } });
+        if (url.includes('/events')) return jsonRes({ errorCode: 0, result: {} });
+        if (url.includes('/devices')) return jsonRes({ errorCode: -1, msg: 'Busy' });
+      });
+      const client = newClient();
+      expect((await client.getTopology())[0].statusCategory).toBe(1);
+      expect(await client.getNocEvents()).toEqual([]);
+      expect(await client.getPoeBudgets()).toEqual([]);
+      expect(await client.getWanStatus()).toBeUndefined();
+
+      mockController((url) => {
+        if (url.includes('/devices')) return jsonRes({ errorCode: 0, result: [{ mac: 'AP', name: 'AP', type: 'ap', status: 14 }] });
+      });
+      expect(await newClient().getWanStatus()).toBeUndefined();
+    });
+
+    it('returns [] for topology, LAN networks and SSIDs when the controller is unreachable', async () => {
+      global.fetch = vi.fn().mockRejectedValue(new TypeError('fetch failed'));
+      const client = newClient();
+      expect(await client.getTopology()).toEqual([]);
+      expect(await client.getLanNetworks()).toEqual([]);
+      expect(await client.getSsids()).toEqual([]);
+      mockController((url) => {
+        if (url.includes('/topology')) return jsonRes({ errorCode: 0, result: null });
+      });
+      expect(await newClient().getTopology()).toEqual([]);
+    });
+
+    it('maps HTML responses to a friendly offline message and recommends AP review for weak clients', async () => {
+      mockController((url) => {
+        if (url.includes('/clients')) return { ok: true, status: 200, text: async () => '<!DOCTYPE html><html></html>' };
+      });
+      const offline = await newClient().getNetworkStatus();
+      expect(offline.error).toMatch(/returned HTML instead of API data/);
+
+      mockController((url) => {
+        if (url.includes('/clients')) return jsonRes({ errorCode: 0, result: [{ mac: 'W', name: 'Weak', wireless: true, rssi: -75 }] });
+        if (url.includes('/devices')) return jsonRes({ errorCode: 0, result: [] });
+      });
+      const audit = await newClient().getNetworkHealthAudit();
+      expect(audit.recommendations[0]).toMatch(/Review AP placement.*Weak/);
+    });
+  });
+
+  describe('SSID bands, PoE budgets, and WAN status', () => {
+    it('labels the band bitmask correctly (7 = tri-band)', async () => {
+      mockController((url) => {
+        if (url.includes('/setting/wlans') && !url.includes('/ssids')) return jsonRes({ errorCode: 0, result: { data: [{ id: 'w1' }] } });
+        if (url.includes('/ssids')) {
+          return jsonRes({ errorCode: 0, result: { data: [{ name: 'A', band: 7 }, { name: 'B', band: 4 }, { name: 'C', band: 99 }] } });
+        }
+      });
+      const ssids = await newClient().getSsids();
+      expect(ssids.map((s) => s.bandText)).toEqual(['Tri-Band (2.4G + 5G + 6G)', '6 GHz Only', 'Dual-Band']);
+    });
+
+    it('omits switches that do not report a PoE budget and passes statusCategory through', async () => {
+      mockController((url) => {
+        if (url.includes('/devices')) {
+          return jsonRes({
+            errorCode: 0,
+            result: [
+              { mac: 'S1', name: 'No Budget', type: 'switch', model: 'SG2210P', poeSupport: true, status: 14 },
+              { mac: 'S2', name: 'Budget', type: 'switch', model: 'SG2205P', poeRemain: 50, status: 14, statusCategory: 1 },
+            ],
+          });
+        }
+      });
+      const poe = await newClient().getPoeBudgets();
+      expect(poe).toHaveLength(1);
+      expect(poe[0]).toMatchObject({ name: 'Budget', poeRemain: 50, totalPoePower: 65, poePowerUsed: 15, statusCategory: 1 });
+    });
+
+    it('builds WAN info from gateway port stats (link state, latency, loss, backup WAN)', async () => {
+      mockController((url) => {
+        if (url.includes('/devices')) {
+          return jsonRes({ errorCode: 0, result: [{ mac: 'GW-1', name: 'GW', type: 'gateway', model: 'ER707-M2', status: 14, uptime: 500 }] });
+        }
+        if (url.includes('/clients')) {
+          return jsonRes({ errorCode: 0, result: [{ mac: 'C1', activity: 1000, uploadActivity: 200 }, { mac: 'C2', activity: 500 }] });
+        }
+        if (url.includes('/gateways/GW-1')) {
+          return jsonRes({
+            errorCode: 0,
+            result: {
+              portStats: [
+                { port: 1, name: 'SFP WAN', mode: 0, status: 1, internetState: 0, ip: '100.64.0.2', gateway: '100.64.0.1', dns1: '9.9.9.9', proto: 'pppoe', latency: 31, loss: 1.5, uptime: 3600 },
+                { port: 2, name: 'WAN2', type: 0, status: 1, proto: 'static' },
+                { port: 3, name: 'LAN', mode: 1, status: 1 },
+              ],
+            },
+          });
+        }
+      });
+      const wan = await newClient().getWanStatus();
+      expect(wan?.primaryWan).toMatchObject({
+        name: 'SFP WAN',
+        online: false, // link up but no internet
+        ip: '100.64.0.2',
+        gateway: '100.64.0.1',
+        dns: ['9.9.9.9'],
+        proto: 'PPPoE',
+        latencyMs: 31,
+        packetLossPercent: 1.5,
+        rxRate: 1500,
+        txRate: 200,
+        uptime: 3600,
+        isPrimary: true,
+      });
+      expect(wan?.backupWan).toMatchObject({ name: 'WAN2', online: true, proto: 'Static', rxRate: 0, uptime: 500, isPrimary: false });
+      expect(wan?.overallUptimePercent).toBeUndefined();
+    });
+
+    it('reports unknown WAN fields as Unknown/undefined when port stats are unavailable', async () => {
+      mockController((url) => {
+        if (url.includes('/devices')) {
+          return jsonRes({ errorCode: 0, result: [{ mac: 'GW-1', name: 'GW', type: 'gateway', model: '', ip: '192.168.0.1', status: 0 }] });
+        }
+        if (url.includes('/clients')) return jsonRes({ errorCode: 0, result: [{ mac: 'C1', activity: 1000 }] });
+        if (url.includes('/gateways/')) return jsonRes({ errorCode: 0, result: { portStats: [{ port: 1, name: 'WAN', mode: 0 }] } });
+      });
+      const wan = await newClient().getWanStatus();
+      expect(wan?.gatewayModel).toBe('Omada SDN Gateway');
+      expect(wan?.primaryWan).toMatchObject({
+        online: false, // gateway itself is disconnected
+        ip: 'Unknown',
+        gateway: 'Unknown',
+        dns: [],
+        proto: 'Unknown',
+        txRate: 0,
+        uptime: 0,
+      });
+      expect(wan?.primaryWan.latencyMs).toBeUndefined();
+      expect(wan?.primaryWan.packetLossPercent).toBeUndefined();
+      expect(wan?.backupWan).toBeUndefined();
+    });
+
+    it('falls back to the gateway connection state when the gateway detail endpoint fails', async () => {
+      mockController((url) => {
+        if (url.includes('/devices')) {
+          return jsonRes({ errorCode: 0, result: [{ mac: 'GW-1', name: 'GW', type: 'gateway', model: 'ER605', status: 0, statusCategory: 1 }] });
+        }
+        if (url.includes('/clients')) return jsonRes({ errorCode: 0, result: [] });
+      });
+      const wan = await newClient().getWanStatus();
+      expect(wan?.primaryWan.online).toBe(true);
+      expect(wan?.primaryWan.name).toBe('WAN 1');
     });
   });
 });

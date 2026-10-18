@@ -2,19 +2,85 @@ import { getOmadaClient, OmadaClient } from '@/lib/omada/client';
 import { getRecentAiInsights, saveAiInsight } from '@/lib/db/queries';
 import {
   AiInsightRecord,
+  AiIssueCategory,
   AiIssueItem,
+  AiIssueSeverity,
   AiPersistingIssueItem,
   AiSuggestionItem,
   AiTrendDirection,
   AiNarration,
 } from '@/types/reports';
 import {
+  NetworkStatusSummary,
   OmadaClientDevice,
   OmadaDeviceItem,
   OmadaLanNetwork,
   OmadaSsidSetting,
   PoeDeviceBudget,
 } from '@/types/omada';
+import { getSignalBand, isDeviceOnline } from '@/lib/omada/formatters';
+
+/**
+ * Raised instead of saving an audit when live telemetry is unavailable: an empty
+ * snapshot would score 100, mark every prior issue "resolved" and poison the baseline.
+ */
+export class AiAuditUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AiAuditUnavailableError';
+  }
+}
+
+function normalizeClientsResult(result: unknown): OmadaClientDevice[] {
+  return Array.isArray(result) ? result : (result as { clients?: OmadaClientDevice[] })?.clients || [];
+}
+
+/** Throws AiAuditUnavailableError unless the controller is online and clients + devices were retrieved. */
+function assertLiveTelemetry(
+  networkStatus: NetworkStatusSummary | null,
+  clientsResult: unknown,
+  devicesResult: OmadaDeviceItem[] | null
+): void {
+  if (!networkStatus || networkStatus.controllerOnline === false) {
+    const reason = networkStatus?.error ? ` (${networkStatus.error})` : '';
+    throw new AiAuditUnavailableError(
+      `Omada controller is offline or unreachable${reason}. AI audit skipped; no record was saved so the historical baseline is unchanged.`
+    );
+  }
+  if (clientsResult === null || devicesResult === null) {
+    throw new AiAuditUnavailableError(
+      'Live telemetry is incomplete (client or device inventory could not be retrieved). AI audit skipped; no record was saved.'
+    );
+  }
+}
+
+/** Instantaneous download + upload rate in bytes/s (rxRate/txRate are PHY link rates, not throughput). */
+function clientRateBytes(c: OmadaClientDevice): number {
+  return (c.activity || 0) + (c.uploadActivity || 0);
+}
+
+const TREND_DIRECTIONS: AiTrendDirection[] = ['IMPROVED', 'DEGRADED', 'STABLE', 'INITIAL'];
+const ISSUE_CATEGORIES: AiIssueCategory[] = [
+  'RF_SIGNAL',
+  'CHANNEL_CONGESTION',
+  'BANDWIDTH_BURST',
+  'DEVICE_OFFLINE',
+  'AUTHENTICATION',
+  'GENERAL',
+];
+const ISSUE_SEVERITIES: AiIssueSeverity[] = ['CRITICAL', 'WARNING', 'INFO'];
+const SUGGESTION_PRIORITIES: AiSuggestionItem['priority'][] = ['HIGH', 'MEDIUM', 'LOW'];
+
+/** LLM output lists: keep only object entries (a non-array or string entries are ignored). */
+function asRecordList(value: unknown): Array<Record<string, unknown>> {
+  return Array.isArray(value)
+    ? value.filter((v): v is Record<string, unknown> => Boolean(v) && typeof v === 'object' && !Array.isArray(v))
+    : [];
+}
+
+function asText(value: unknown): string {
+  return typeof value === 'string' ? value : '';
+}
 
 /**
  * Intelligent helper to determine if a client device is an IoT / Smart Home endpoint
@@ -87,15 +153,16 @@ export async function runComparativeAiInsight(
   ] = await Promise.all([
     getRecentAiInsights(10),
     client.getNetworkStatus().catch(() => null),
-    client.getActiveClients().catch(() => [] as OmadaClientDevice[]),
-    client.getDevices('all').catch(() => [] as OmadaDeviceItem[]),
+    client.getActiveClients().catch(() => null),
+    client.getDevices('all').catch(() => null),
     typeof client.getLanNetworks === 'function' ? client.getLanNetworks().catch(() => [] as OmadaLanNetwork[]) : Promise.resolve([]),
     typeof client.getPoeBudgets === 'function' ? client.getPoeBudgets().catch(() => [] as PoeDeviceBudget[]) : Promise.resolve([]),
   ]);
 
-  const clients: OmadaClientDevice[] = Array.isArray(clientsResult)
-    ? clientsResult
-    : (clientsResult as { clients?: OmadaClientDevice[] })?.clients || [];
+  // Never record an audit from an empty "controller down" snapshot
+  assertLiveTelemetry(networkStatus, clientsResult, devicesResult);
+
+  const clients = normalizeClientsResult(clientsResult);
   const devices: OmadaDeviceItem[] = devicesResult || [];
   const networks: OmadaLanNetwork[] = lanNetworksResult || [];
   const poeDevices: PoeDeviceBudget[] = poeBudgetsResult || [];
@@ -105,7 +172,7 @@ export async function runComparativeAiInsight(
   const currentDiscoveredIssues: AiIssueItem[] = [];
 
   // A. Check for offline infrastructure devices
-  const offlineDevices = devices.filter((d) => d.status === 0);
+  const offlineDevices = devices.filter((d) => !isDeviceOnline(d));
   for (const dev of offlineDevices) {
     currentDiscoveredIssues.push({
       id: `dev-offline-${dev.mac.replace(/:/g, '')}`,
@@ -117,16 +184,16 @@ export async function runComparativeAiInsight(
     });
   }
 
-  // B. Check for poor RF signal clients (RSSI < -80 dBm)
-  const weakSignalClients = clients.filter((c) => c.wireless && (c.rssi ?? c.signalLevel ?? -65) < -80);
+  // B. Check for poor RF signal clients (RSSI < -80 dBm, or signal level < 25% when RSSI is not reported)
+  const weakSignalClients = clients.filter((c) => c.wireless && getSignalBand(c) === 'poor');
   for (const c of weakSignalClients) {
-    const rssi = c.rssi ?? c.signalLevel ?? -85;
+    const signalText = typeof c.rssi === 'number' ? `${c.rssi} dBm` : `${c.signalLevel}% signal level`;
     currentDiscoveredIssues.push({
       id: `rf-weak-${c.mac.replace(/:/g, '')}`,
       category: 'RF_SIGNAL',
       severity: 'WARNING',
       title: `Sub-Optimal RF Signal (${c.name || c.hostName || c.mac})`,
-      description: `Client device is connected with weak signal (${rssi} dBm) on AP ${c.apName || 'Unknown AP'}, risking packet retries.`,
+      description: `Client device is connected with weak signal (${signalText}) on AP ${c.apName || 'Unknown AP'}, risking packet retries.`,
       affectedEntities: [c.mac, c.name || c.mac],
     });
   }
@@ -166,13 +233,10 @@ export async function runComparativeAiInsight(
   }
 
   // D. Check for sudden bandwidth surge
-  const heavySurgeClients = clients.filter((c) => {
-    const rateBytes = c.activity ?? ((c.rxRate || 0) + (c.txRate || 0));
-    return (rateBytes * 8) / 1_000_000 > 50; // > 50 Mbps
-  });
+  const heavySurgeClients = clients.filter((c) => (clientRateBytes(c) * 8) / 1_000_000 > 50); // > 50 Mbps
 
   for (const c of heavySurgeClients) {
-    const mbps = parseFloat((((c.activity || 0) * 8) / 1_000_000).toFixed(1));
+    const mbps = parseFloat(((clientRateBytes(c) * 8) / 1_000_000).toFixed(1));
     currentDiscoveredIssues.push({
       id: `burst-${c.mac.replace(/:/g, '')}`,
       category: 'BANDWIDTH_BURST',
@@ -270,7 +334,7 @@ export async function runComparativeAiInsight(
       persistingCount > 0
         ? `${persistingCount} condition(s) under observation.`
         : 'Zero chronic infrastructure faults observed.'
-    } Starlink primary WAN uplink maintained steady latency (24 ms) with zero core outages.`;
+    }`;
   }
 
   let deltaChanges = '';
@@ -381,7 +445,7 @@ export async function runComparativeAiInsight(
       wirelessClients: wirelessTotal,
       wiredClients: clients.length - wirelessTotal,
       iotClients: iotCount,
-      siteName: networkStatus?.siteName || 'The Farm',
+      siteName: networkStatus?.siteName || 'Unknown',
       narration,
     },
   });
@@ -403,7 +467,7 @@ export async function runDeepSeekAgentInsight(
   customClient?: OmadaClient,
   model = process.env.OLLAMA_MODEL || 'deepseek-r1:7b'
 ): Promise<AiInsightRecord> {
-  const { generateNeuralAiInsight } = await import('@/lib/ai/ollama');
+  const { generateNeuralAiInsight, extractJsonObject } = await import('@/lib/ai/ollama');
   const client = customClient || getOmadaClient();
 
   // 1. Fetch live telemetry and historical audits in parallel
@@ -417,15 +481,16 @@ export async function runDeepSeekAgentInsight(
   ] = await Promise.all([
     getRecentAiInsights(5),
     client.getNetworkStatus().catch(() => null),
-    client.getActiveClients().catch(() => [] as OmadaClientDevice[]),
-    client.getDevices('all').catch(() => [] as OmadaDeviceItem[]),
+    client.getActiveClients().catch(() => null),
+    client.getDevices('all').catch(() => null),
     typeof client.getLanNetworks === 'function' ? client.getLanNetworks().catch(() => [] as OmadaLanNetwork[]) : Promise.resolve([]),
     typeof client.getSsids === 'function' ? client.getSsids().catch(() => [] as OmadaSsidSetting[]) : Promise.resolve([]),
   ]);
 
-  const clients: OmadaClientDevice[] = Array.isArray(clientsResult)
-    ? clientsResult
-    : (clientsResult as { clients?: OmadaClientDevice[] })?.clients || [];
+  // Don't spend an inference (or save a record) on an empty "controller down" snapshot
+  assertLiveTelemetry(networkStatus, clientsResult, devicesResult);
+
+  const clients = normalizeClientsResult(clientsResult);
   const devices: OmadaDeviceItem[] = devicesResult || [];
   const networks: OmadaLanNetwork[] = lanNetworksResult || [];
   const ssids: OmadaSsidSetting[] = ssidsResult || [];
@@ -467,18 +532,23 @@ Format your response strictly as JSON conforming to this structure (do not wrap 
 }`;
 
   const telemetryPayload = {
-    siteName: networkStatus?.siteName || 'The Farm',
-    controllerOnline: networkStatus?.controllerOnline ?? true,
+    siteName: networkStatus?.siteName || 'Unknown',
+    controllerOnline: true, // guaranteed by assertLiveTelemetry
     totalClients: clients.length,
     wirelessClients: clients.filter((c) => c.wireless).length,
     wiredClients: clients.filter((c) => !c.wireless).length,
     clientsOn2G: clients.filter((c) => c.wireless && (!c.channel || c.channel <= 14)).length,
     clientsOn5G: clients.filter((c) => c.wireless && c.channel && c.channel > 14).length,
     iotClientsDetected: clients.filter((c) => isIotClient(c, networks)).length,
-    offlineHardware: devices.filter((d) => d.status === 0).map((d) => ({ name: d.name, ip: d.ip, mac: d.mac, model: d.model })),
-    onlineHardware: devices.filter((d) => d.status !== 0).map((d) => ({ name: d.name, ip: d.ip, type: d.type, model: d.model, clients: d.clientNum })),
-    weakClients: clients.filter((c) => c.wireless && (c.rssi ?? -65) < -80).map((c) => ({ name: c.name || c.mac, rssi: c.rssi, ap: c.apName })),
-    topBandwidthConsumers: clients.slice(0, 5).map((c) => ({ name: c.name || c.mac, activityMbps: (((c.activity || 0) * 8) / 1_000_000).toFixed(2) })),
+    offlineHardware: devices.filter((d) => !isDeviceOnline(d)).map((d) => ({ name: d.name, ip: d.ip, mac: d.mac, model: d.model })),
+    onlineHardware: devices.filter((d) => isDeviceOnline(d)).map((d) => ({ name: d.name, ip: d.ip, type: d.type, model: d.model, clients: d.clientNum })),
+    weakClients: clients
+      .filter((c) => c.wireless && getSignalBand(c) === 'poor')
+      .map((c) => ({ name: c.name || c.mac, rssi: c.rssi, signalLevel: c.signalLevel, ap: c.apName })),
+    topBandwidthConsumers: [...clients]
+      .sort((a, b) => (b.activity || 0) - (a.activity || 0))
+      .slice(0, 5)
+      .map((c) => ({ name: c.name || c.mac, activityMbps: (((c.activity || 0) * 8) / 1_000_000).toFixed(2) })),
     vlans: networks.map((n) => ({ vlan: n.vlan, name: n.name, subnet: n.gatewaySubnet })),
     ssids: ssids.map((s) => ({ name: s.name, band: s.bandText })),
     previousHealthScore: previousAudit?.healthScore ?? null,
@@ -489,37 +559,33 @@ Format your response strictly as JSON conforming to this structure (do not wrap 
   // 3. Execute real Neural Inference via Ollama
   const llmResult = await generateNeuralAiInsight(systemPrompt, userPrompt, model);
 
-  // 4. Parse LLM JSON output with robust regex extraction
-  let parsedJson: {
-    healthScore?: number;
-    trendDirection?: AiTrendDirection;
+  // 4. Parse the LLM's JSON verdict (chain-of-thought already stripped by generateNeuralAiInsight)
+  const parsedJson = extractJsonObject<{
+    healthScore?: unknown;
+    trendDirection?: unknown;
     executiveSummary?: string;
     narration?: {
       historyContext?: string;
       deltaChanges?: string;
       currentStatus?: string;
     };
-    issues?: AiIssueItem[];
-    suggestions?: AiSuggestionItem[];
-  } = {};
+    issues?: unknown;
+    suggestions?: unknown;
+  }>(llmResult.response);
 
-  try {
-    const jsonMatch = llmResult.response.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      parsedJson = JSON.parse(jsonMatch[0]);
-    }
-  } catch {
-    // If model outputs prose instead of strict JSON, synthesize clean structured fields
-    parsedJson = {
-      healthScore: 92,
-      trendDirection: previousAudit ? 'STABLE' : 'INITIAL',
-      executiveSummary: llmResult.response.slice(0, 200),
-    };
+  const rawScore = typeof parsedJson?.healthScore === 'string' ? Number(parsedJson.healthScore) : parsedJson?.healthScore;
+  if (!parsedJson || typeof rawScore !== 'number' || !Number.isFinite(rawScore)) {
+    // Never invent a score: report the failure instead of saving a record
+    throw new AiAuditUnavailableError(
+      `${llmResult.model} did not return a parseable JSON verdict with a numeric healthScore. No record was saved; try again or use a larger num_predict/model.`
+    );
   }
 
-  const healthScore = typeof parsedJson.healthScore === 'number' ? Math.max(0, Math.min(100, parsedJson.healthScore)) : 92;
+  const healthScore = Math.round(Math.max(0, Math.min(100, rawScore)));
   const scoreDelta = previousAudit ? healthScore - previousAudit.healthScore : 0;
-  const trendDirection = parsedJson.trendDirection || (previousAudit ? (scoreDelta > 0 ? 'IMPROVED' : scoreDelta < 0 ? 'DEGRADED' : 'STABLE') : 'INITIAL');
+  const llmTrend = TREND_DIRECTIONS.find((t) => t === parsedJson.trendDirection);
+  const trendDirection: AiTrendDirection =
+    llmTrend || (previousAudit ? (scoreDelta > 0 ? 'IMPROVED' : scoreDelta < 0 ? 'DEGRADED' : 'STABLE') : 'INITIAL');
   const executiveSummary = parsedJson.executiveSummary || `DeepSeek-R1 Neural Agent evaluated ${clients.length} connected devices across ${devices.length} infrastructure nodes.`;
 
   const narration: AiNarration = {
@@ -529,20 +595,20 @@ Format your response strictly as JSON conforming to this structure (do not wrap 
     fullNarrative: `${parsedJson.narration?.historyContext || ''}\n\n${parsedJson.narration?.deltaChanges || ''}\n\n${parsedJson.narration?.currentStatus || ''}`.trim(),
   };
 
-  const newIssues: AiIssueItem[] = (parsedJson.issues || []).map((i, idx) => ({
-    id: i.id || `llm-issue-${idx}`,
-    category: i.category || 'GENERAL',
-    severity: i.severity || 'INFO',
-    title: i.title || 'Observed Condition',
-    description: i.description || '',
+  const newIssues: AiIssueItem[] = asRecordList(parsedJson.issues).map((i, idx) => ({
+    id: asText(i.id) || `llm-issue-${idx}`,
+    category: ISSUE_CATEGORIES.find((c) => c === i.category) || 'GENERAL',
+    severity: ISSUE_SEVERITIES.find((sev) => sev === i.severity) || 'INFO',
+    title: asText(i.title) || 'Observed Condition',
+    description: asText(i.description),
   }));
 
-  const actionableSuggestions: AiSuggestionItem[] = (parsedJson.suggestions || []).map((s, idx) => ({
-    id: s.id || `llm-sug-${idx}`,
-    priority: s.priority || 'MEDIUM',
-    title: s.title || 'Recommended Action',
-    action: s.action || '',
-    expectedImpact: s.expectedImpact || '',
+  const actionableSuggestions: AiSuggestionItem[] = asRecordList(parsedJson.suggestions).map((s, idx) => ({
+    id: asText(s.id) || `llm-sug-${idx}`,
+    priority: SUGGESTION_PRIORITIES.find((p) => p === s.priority) || 'MEDIUM',
+    title: asText(s.title) || 'Recommended Action',
+    action: asText(s.action),
+    expectedImpact: asText(s.expectedImpact),
   }));
 
   // 5. Save to database with engineType and thinking metadata
@@ -564,7 +630,7 @@ Format your response strictly as JSON conforming to this structure (do not wrap 
     metricsSnapshot: {
       totalClients: clients.length,
       totalDevices: devices.length,
-      siteName: networkStatus?.siteName || 'The Farm',
+      siteName: networkStatus?.siteName || 'Unknown',
       narration,
       thinkingProcess: llmResult.thinking,
       llmModel: llmResult.model,

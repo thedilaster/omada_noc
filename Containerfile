@@ -7,7 +7,7 @@ RUN apk add --no-cache libc6-compat
 WORKDIR /app
 
 COPY package.json package-lock.json* ./
-RUN npm install
+RUN npm ci
 
 # 2. Rebuild the source code only when needed
 FROM base AS builder
@@ -32,6 +32,9 @@ RUN addgroup --system --gid 1001 nodejs
 RUN adduser --system --uid 1001 nextjs
 
 COPY --from=builder /app/public ./public
+# The docs viewer reads these from disk at runtime; standalone tracing doesn't include them
+COPY --from=builder --chown=nextjs:nodejs /app/docs ./docs
+COPY --from=builder --chown=nextjs:nodejs /app/README.md ./README.md
 
 # Set the correct permissions for prerender cache
 RUN mkdir .next

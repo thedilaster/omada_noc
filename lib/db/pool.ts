@@ -3,17 +3,40 @@ import { Pool } from 'pg';
 let globalPool: Pool | null = null;
 let fallbackToMemory = false;
 
-export function isMemoryFallbackActive(): boolean {
-  return fallbackToMemory;
+/**
+ * Whether the in-memory store may stand in for PostgreSQL. ALLOW_MEMORY_FALLBACK ('true'/'false')
+ * wins when set; otherwise only non-production builds may fall back. In production the memory
+ * store would hide real users and expose the public default admin password, so DB errors surface.
+ */
+export function isMemoryFallbackAllowed(): boolean {
+  const flag = process.env.ALLOW_MEMORY_FALLBACK?.trim().toLowerCase();
+  if (flag === 'true') return true;
+  if (flag === 'false') return false;
+  return process.env.NODE_ENV !== 'production';
 }
 
-export function activateMemoryFallback(reason?: string): void {
+export function isMemoryFallbackActive(): boolean {
+  return fallbackToMemory && isMemoryFallbackAllowed();
+}
+
+/**
+ * Switches all queries to the in-memory store. Returns false (and stays on PostgreSQL)
+ * when memory fallback is not allowed in this environment.
+ */
+export function activateMemoryFallback(reason?: string): boolean {
+  if (!isMemoryFallbackAllowed()) {
+    if (reason) {
+      console.error(`[Database] PostgreSQL error (memory fallback disabled): ${reason}`);
+    }
+    return false;
+  }
   if (!fallbackToMemory) {
     fallbackToMemory = true;
     if (reason) {
       console.warn(`⚠️ [Database] Activating In-Memory Store fallback: ${reason}`);
     }
   }
+  return true;
 }
 
 export function resetMemoryFallback(): void {
@@ -50,6 +73,15 @@ export function isConnectionOrAuthError(err: unknown): boolean {
 }
 
 /**
+ * Single decision point for query catch blocks: true (and fallback activated) when the error
+ * is a connection/auth failure and memory fallback is allowed; false means rethrow.
+ */
+export function shouldFallbackToMemory(err: unknown): boolean {
+  if (!isConnectionOrAuthError(err)) return false;
+  return activateMemoryFallback((err as Error).message);
+}
+
+/**
  * Returns a singleton PostgreSQL connection pool.
  */
 export function getDbPool(): Pool {
@@ -65,7 +97,7 @@ export function getDbPool(): Pool {
     });
 
     globalPool.on('error', (err) => {
-      if (isConnectionOrAuthError(err)) {
+      if (isConnectionOrAuthError(err) && isMemoryFallbackAllowed()) {
         activateMemoryFallback(err.message);
       } else {
         console.error('Unexpected error on idle PostgreSQL client pool:', err);

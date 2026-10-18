@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
-import { getCurrentSession } from '@/lib/auth/session';
-import { updateUserRole, updateUserPassword, deleteUser, findUserById } from '@/lib/db/queries';
+import { requireAdmin } from '@/lib/auth/guards';
+import { updateUserRole, updateUserPassword, deleteUser, findUserById, countAdmins } from '@/lib/db/queries';
 import { hashPassword } from '@/lib/auth/password';
 
 export async function PUT(
@@ -8,10 +8,8 @@ export async function PUT(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const session = await getCurrentSession();
-    if (!session || session.role !== 'ADMIN') {
-      return NextResponse.json({ error: 'Forbidden: Admin access required' }, { status: 403 });
-    }
+    const guard = await requireAdmin();
+    if (!guard.ok) return guard.response;
 
     const { id } = await params;
     const body = await request.json();
@@ -22,17 +20,35 @@ export async function PUT(
       return NextResponse.json({ error: 'User not found' }, { status: 404 });
     }
 
-    if (role && (role === 'ADMIN' || role === 'USER')) {
-      await updateUserRole(id, role);
+    // Validate everything before writing so a rejected request changes nothing
+    if (newPassword && newPassword.length < 8) {
+      return NextResponse.json(
+        { error: 'Password must be at least 8 characters long.' },
+        { status: 400 }
+      );
+    }
+
+    const roleChange = (role === 'ADMIN' || role === 'USER') && role !== user.role ? role : null;
+
+    if (roleChange && id === guard.session.userId) {
+      return NextResponse.json(
+        { error: 'You cannot change the role of your own administrator account.' },
+        { status: 400 }
+      );
+    }
+
+    if (roleChange === 'USER' && user.role === 'ADMIN' && (await countAdmins()) <= 1) {
+      return NextResponse.json(
+        { error: 'Cannot demote the last remaining administrator.' },
+        { status: 400 }
+      );
+    }
+
+    if (roleChange) {
+      await updateUserRole(id, roleChange);
     }
 
     if (newPassword) {
-      if (newPassword.length < 8) {
-        return NextResponse.json(
-          { error: 'Password must be at least 8 characters long.' },
-          { status: 400 }
-        );
-      }
       const hashed = await hashPassword(newPassword);
       await updateUserPassword(id, hashed);
     }
@@ -54,17 +70,27 @@ export async function DELETE(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const session = await getCurrentSession();
-    if (!session || session.role !== 'ADMIN') {
-      return NextResponse.json({ error: 'Forbidden: Admin access required' }, { status: 403 });
-    }
+    const guard = await requireAdmin();
+    if (!guard.ok) return guard.response;
 
     const { id } = await params;
 
     // Prevent self-deletion
-    if (session.userId === id) {
+    if (guard.session.userId === id) {
       return NextResponse.json(
         { error: 'You cannot delete your own active administrator account.' },
+        { status: 400 }
+      );
+    }
+
+    const user = await findUserById(id);
+    if (!user) {
+      return NextResponse.json({ error: 'User not found' }, { status: 404 });
+    }
+
+    if (user.role === 'ADMIN' && (await countAdmins()) <= 1) {
+      return NextResponse.json(
+        { error: 'Cannot delete the last remaining administrator.' },
         { status: 400 }
       );
     }

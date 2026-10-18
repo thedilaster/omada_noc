@@ -73,10 +73,8 @@ async function runMcpAgent() {
     env: {
       ...process.env,
       OMADA_URL: process.env.OMADA_URL || '192.168.100.2',
-      OMADA_USER: process.env.OMADA_USER || 'admin',
-      OMADA_PASS: process.env.OMADA_PASS || 'password',
       OMADA_SITE: process.env.OMADA_SITE || 'Default',
-      OMADA_ALLOW_INSECURE_SSL: 'true',
+      // OMADA_ALLOW_INSECURE_SSL is inherited from the environment (TLS verification stays on unless it is "true")
     },
   });
 
@@ -99,6 +97,7 @@ async function runMcpAgent() {
 
     console.log('🧠 Step 3: Executing AI Agent Question-Answering Scenarios...\n');
 
+    const failedScenarios: string[] = [];
     for (let i = 0; i < DEMO_SCENARIOS.length; i++) {
       const scenario = DEMO_SCENARIOS[i];
       console.log('------------------------------------------------------');
@@ -118,9 +117,14 @@ async function runMcpAgent() {
       });
       const duration = Date.now() - startTime;
 
-      console.log(`⚡ \x1b[32mHardware Response Received (${duration}ms from 192.168.100.2):\x1b[0m`);
       const contentList = result.content as Array<{ type: string; text: string }>;
       const responseText = contentList?.[0]?.text || '';
+      if (result.isError) {
+        failedScenarios.push(`${scenario.expectedTool}: ${responseText.split('\n')[0]}`);
+        console.log(`❌ \x1b[31mTool returned an error (${duration}ms):\x1b[0m`);
+      } else {
+        console.log(`⚡ \x1b[32mController Response Received (${duration}ms):\x1b[0m`);
+      }
       
       // Indent response text for clean terminal presentation
       console.log(
@@ -132,11 +136,17 @@ async function runMcpAgent() {
       console.log('');
     }
 
+    await client.close();
+
     console.log('======================================================');
+    if (failedScenarios.length > 0) {
+      console.log(`  ❌ ${failedScenarios.length} of ${DEMO_SCENARIOS.length} MCP scenario(s) failed:`);
+      failedScenarios.forEach((f) => console.log(`     • ${f}`));
+      console.log('======================================================\n');
+      process.exit(1);
+    }
     console.log('  🎉 All MCP Question-Answering Scenarios Passed!     ');
     console.log('======================================================\n');
-
-    await client.close();
     process.exit(0);
   } catch (error: unknown) {
     console.error('\n❌ MCP Agent Execution Failed:', error);

@@ -2,7 +2,8 @@ import { NextResponse } from 'next/server';
 import { getOmadaClient } from '@/lib/omada/client';
 import { TelemetryResponse, OmadaClientDevice } from '@/types/omada';
 import { getCurrentSession } from '@/lib/auth/session';
-import { getUserDeviceTags } from '@/lib/db/queries';
+import { resolveTelemetryViewer, scopeTelemetry } from '@/lib/auth/device-scope';
+import { parseBoundedInt } from '@/lib/db/validation';
 import { resolveClientVlan } from '@/lib/omada/formatters';
 
 export const dynamic = 'force-dynamic';
@@ -11,28 +12,26 @@ export const revalidate = 0;
 export async function GET(request: Request) {
   try {
     const { searchParams } = new URL(request.url);
-    const limit = parseInt(searchParams.get('limit') || '10', 10);
+    const limit = parseBoundedInt(searchParams.get('limit'), 10, 1, 1000);
     const includeAll = searchParams.get('all') === 'true';
     const sortBy = (searchParams.get('sort') || 'activity') as 'activity' | 'traffic' | 'uptime';
 
     const client = getOmadaClient();
     const rawStatus = await client.getNetworkStatus();
 
-    let topClients: OmadaClientDevice[] = [];
-    let allClients: OmadaClientDevice[] | undefined = undefined;
-    let status = { ...rawStatus };
+    let clients: OmadaClientDevice[] = [];
 
     let topology = undefined;
-    let networks = undefined;
-    let ssids = undefined;
+    let netData = undefined;
+    let ssidData = undefined;
     let poeDevices = undefined;
     let devices = undefined;
-    let wanStatus = undefined;
-    let events = undefined;
+    let wanData = undefined;
+    let eventData = undefined;
 
-    if (status.controllerOnline) {
+    if (rawStatus.controllerOnline) {
       try {
-        const [rawClients, topoData, netData, ssidData, poeData, devData, wanData, eventData] = await Promise.all([
+        const [rawClients, topoData, nets, ssidList, poeData, devData, wan, evts] = await Promise.all([
           client.getActiveClients(),
           typeof client.getTopology === 'function' ? client.getTopology().catch(() => []) : Promise.resolve([]),
           typeof client.getLanNetworks === 'function' ? client.getLanNetworks().catch(() => []) : Promise.resolve([]),
@@ -44,83 +43,47 @@ export async function GET(request: Request) {
         ]);
 
         // Enrich clients with resolved vlanId
-        let clients = (rawClients || []).map((c) => ({
+        clients = (rawClients || []).map((c) => ({
           ...c,
-          vlanId: resolveClientVlan(c, netData, ssidData),
+          vlanId: resolveClientVlan(c, nets, ssidList),
         }));
         topology = topoData;
+        netData = nets;
+        ssidData = ssidList;
         poeDevices = poeData;
         devices = devData;
-        wanStatus = wanData;
-        events = eventData;
-
-        // Map live client counts into networks & SSIDs
-        if (netData && netData.length > 0) {
-          networks = netData.map((net) => ({
-            ...net,
-            clientCount: clients.filter((c) => c.vlanId === net.vlan).length,
-          }));
-        } else {
-          networks = netData;
-        }
-
-        if (ssidData && ssidData.length > 0) {
-          ssids = ssidData.map((s) => ({
-            ...s,
-            clientCount: clients.filter((c) => c.ssid?.toLowerCase() === s.name.toLowerCase()).length,
-          }));
-        } else {
-          ssids = ssidData;
-        }
-
-        // 1. Check Session & Device Tagging Scoping
-        const session = await getCurrentSession();
-        if (session && session.role !== 'ADMIN') {
-          const userTags = await getUserDeviceTags(session.userId);
-          if (userTags.length > 0) {
-            const allowedMacs = new Set(userTags.map((t) => t.macAddress.toUpperCase()));
-            // Scope clients strictly to tagged MACs
-            clients = clients.filter((c) => allowedMacs.has((c.mac || '').toUpperCase()));
-
-            // Recalculate KPIs for scoped user view
-            const wirelessCount = clients.filter((c) => c.wireless).length;
-            const wiredCount = clients.filter((c) => !c.wireless).length;
-            const totalActivity = clients.reduce((acc, c) => acc + (c.activity || 0), 0);
-            const totalDown = clients.reduce((acc, c) => acc + (c.trafficDown || 0), 0);
-            const totalUp = clients.reduce((acc, c) => acc + (c.trafficUp || 0), 0);
-
-            status = {
-              ...status,
-              totalClients: clients.length,
-              wirelessClients: wirelessCount,
-              wiredClients: wiredCount,
-              totalActivityRate: totalActivity,
-              totalTrafficDown: totalDown,
-              totalTrafficUp: totalUp,
-            };
-          }
-          // If userTags.length === 0: Fallback rule "if nothing is tagged then you get to see everything."
-        }
-
-        const sorted = [...clients].sort((a, b) => {
-          if (sortBy === 'activity') return (b.activity || 0) - (a.activity || 0);
-          if (sortBy === 'traffic') {
-            const aT = (a.trafficDown || 0) + (a.trafficUp || 0);
-            const bT = (b.trafficDown || 0) + (b.trafficUp || 0);
-            return bT - aT;
-          }
-          if (sortBy === 'uptime') return (b.uptime || 0) - (a.uptime || 0);
-          return 0;
-        });
-
-        topClients = sorted.slice(0, limit);
-        if (includeAll) {
-          allClients = sorted;
-        }
+        wanData = wan;
+        eventData = evts;
       } catch (err) {
         console.error('Error fetching clients in telemetry route:', err);
       }
     }
+
+    // Device Tagging Scoping (shared with the dashboard page); fails closed for non-admins
+    const viewer = await resolveTelemetryViewer(await getCurrentSession());
+    const scopedView = await scopeTelemetry(viewer, {
+      status: { ...rawStatus },
+      clients,
+      networks: netData,
+      ssids: ssidData,
+      wanStatus: wanData,
+      events: eventData,
+    });
+    const { status, networks, ssids, wanStatus, events } = scopedView;
+
+    const sorted = [...scopedView.clients].sort((a, b) => {
+      if (sortBy === 'activity') return (b.activity || 0) - (a.activity || 0);
+      if (sortBy === 'traffic') {
+        const aT = (a.trafficDown || 0) + (a.trafficUp || 0);
+        const bT = (b.trafficDown || 0) + (b.trafficUp || 0);
+        return bT - aT;
+      }
+      if (sortBy === 'uptime') return (b.uptime || 0) - (a.uptime || 0);
+      return 0;
+    });
+
+    const topClients = sorted.slice(0, limit);
+    const allClients = includeAll ? sorted : undefined;
 
     const payload: TelemetryResponse = {
       status,

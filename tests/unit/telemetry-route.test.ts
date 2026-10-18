@@ -4,9 +4,31 @@ import * as omadaClientModule from '@/lib/omada/client';
 import * as sessionModule from '@/lib/auth/session';
 import * as dbQueries from '@/lib/db/queries';
 
+const ADMIN_SESSION = {
+  userId: 'u-admin',
+  username: 'admin',
+  email: 'admin@omadanoc.com',
+  role: 'ADMIN' as const,
+  lastActive: Date.now(),
+};
+
+const dbUser = (id: string, role: 'ADMIN' | 'USER') => ({
+  id,
+  username: id,
+  email: `${id}@test.com`,
+  role,
+  createdAt: '',
+  updatedAt: '',
+});
+
 describe('API Route: /api/telemetry', () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    vi.restoreAllMocks();
+    // Scoping uses the stored role, so the session user must exist in the database
+    vi.spyOn(sessionModule, 'getCurrentSession').mockResolvedValue(ADMIN_SESSION);
+    vi.spyOn(dbQueries, 'findUserById').mockImplementation(async (id: string) =>
+      id === 'u-admin' ? dbUser('u-admin', 'ADMIN') : id === 'user-regular' ? dbUser('user-regular', 'USER') : null
+    );
   });
 
   it('returns 200 with telemetry summary and sorted clients when controller is online', async () => {
@@ -41,7 +63,6 @@ describe('API Route: /api/telemetry', () => {
     };
 
     vi.spyOn(omadaClientModule, 'getOmadaClient').mockReturnValue(mockClientInstance as any);
-    vi.spyOn(sessionModule, 'getCurrentSession').mockResolvedValue(null);
 
     // Test activity sorting (default) and all=true
     const req1 = new Request('http://localhost:3000/api/telemetry?limit=10&all=true&sort=activity');
@@ -72,6 +93,40 @@ describe('API Route: /api/telemetry', () => {
     const res4 = await GET(req4);
     const json4 = await res4.json();
     expect(json4.topClients).toHaveLength(2);
+
+    // A non-numeric limit falls back to the default instead of returning no clients
+    const res5 = await GET(new Request('http://localhost:3000/api/telemetry?limit=abc'));
+    expect((await res5.json()).topClients).toHaveLength(2);
+
+    const res6 = await GET(new Request('http://localhost:3000/api/telemetry?limit=1'));
+    expect((await res6.json()).topClients).toHaveLength(1);
+  });
+
+  it('returns no clients when there is no session or the session user no longer exists', async () => {
+    const mockClientInstance = {
+      getNetworkStatus: vi.fn().mockResolvedValue({ controllerOnline: true, totalClients: 2 }),
+      getActiveClients: vi.fn().mockResolvedValue([{ mac: '01' }, { mac: '02' }]),
+      getNocEvents: vi.fn().mockResolvedValue([{ id: 'e1' }]),
+    };
+    vi.spyOn(omadaClientModule, 'getOmadaClient').mockReturnValue(mockClientInstance as any);
+
+    vi.spyOn(sessionModule, 'getCurrentSession').mockResolvedValue(null);
+    const json1 = await (await GET(new Request('http://localhost:3000/api/telemetry?all=true'))).json();
+    expect(json1.topClients).toEqual([]);
+    expect(json1.allClients).toEqual([]);
+    expect(json1.status.totalClients).toBe(0);
+    expect(json1.events).toBeUndefined();
+
+    vi.spyOn(sessionModule, 'getCurrentSession').mockResolvedValue({ ...ADMIN_SESSION, userId: 'u-deleted' });
+    const json2 = await (await GET(new Request('http://localhost:3000/api/telemetry'))).json();
+    expect(json2.topClients).toEqual([]);
+
+    // A failing user lookup also fails closed
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(dbQueries, 'findUserById').mockRejectedValue(new Error('DB down'));
+    vi.spyOn(sessionModule, 'getCurrentSession').mockResolvedValue(ADMIN_SESSION);
+    const json3 = await (await GET(new Request('http://localhost:3000/api/telemetry'))).json();
+    expect(json3.topClients).toEqual([]);
   });
 
   it('scopes telemetry and recalculates KPIs for regular users with tagged devices', async () => {
@@ -110,11 +165,12 @@ describe('API Route: /api/telemetry', () => {
       lastActive: Date.now(),
     });
 
+    // Stored canonically (dashed) while Omada reports colons here: must still match
     vi.spyOn(dbQueries, 'getUserDeviceTags').mockResolvedValue([
       {
         id: 't-1',
         userId: 'user-regular',
-        macAddress: 'AA:BB:CC:DD:EE:01',
+        macAddress: 'AA-BB-CC-DD-EE-01',
         deviceName: 'Work Laptop',
         createdAt: '',
       },
@@ -132,6 +188,82 @@ describe('API Route: /api/telemetry', () => {
     expect(json.status.wiredClients).toBe(0);
     expect(json.status.totalActivityRate).toBe(100);
     expect(json.status.totalTrafficDown).toBe(1000);
+  });
+
+  it('computes VLAN/SSID counts after scoping and hides site-wide data from scoped users', async () => {
+    const mockClientInstance = {
+      getNetworkStatus: vi.fn().mockResolvedValue({ controllerOnline: true, totalClients: 3 }),
+      getActiveClients: vi.fn().mockResolvedValue([
+        { mac: '30-68-93-E8-29-54', wireless: true, ssid: 'Staff', vlanId: 20, activity: 10 },
+        { mac: '30-68-93-E8-29-55', wireless: true, ssid: 'Staff', vlanId: 20, activity: 20 },
+        { mac: '30-68-93-E8-29-56', wireless: true, ssid: 'Guest', vlanId: 30, activity: 30 },
+      ]),
+      getLanNetworks: vi.fn().mockResolvedValue([
+        { id: 'n20', name: 'Staff', vlan: 20 },
+        { id: 'n30', name: 'Guest', vlan: 30 },
+      ]),
+      getSsids: vi.fn().mockResolvedValue([
+        { id: 's1', name: 'Staff', vlanId: 20 },
+        { id: 's2', name: 'Guest', vlanId: 30 },
+      ]),
+      getWanStatus: vi.fn().mockResolvedValue({
+        gatewayModel: 'ER605',
+        primaryWan: { port: 1, rxRate: 9000, txRate: 1000 },
+        backupWan: { port: 2, rxRate: 50, txRate: 5 },
+        dualWanMode: 'Failover',
+        overallUptimePercent: 99,
+      }),
+      getNocEvents: vi.fn().mockResolvedValue([{ id: 'e1', clientMac: '30-68-93-E8-29-56' }]),
+    };
+    vi.spyOn(omadaClientModule, 'getOmadaClient').mockReturnValue(mockClientInstance as any);
+    vi.spyOn(sessionModule, 'getCurrentSession').mockResolvedValue({
+      userId: 'user-regular',
+      username: 'jdoe',
+      email: 'jdoe@test.com',
+      role: 'USER',
+      lastActive: Date.now(),
+    });
+    vi.spyOn(dbQueries, 'getUserDeviceTags').mockResolvedValue([
+      { id: 't1', userId: 'user-regular', macAddress: '30:68:93:e8:29:54', createdAt: '' },
+    ]);
+
+    const json = await (await GET(new Request('http://localhost:3000/api/telemetry?all=true'))).json();
+    expect(json.allClients).toHaveLength(1);
+    expect(json.networks.map((n: { clientCount: number }) => n.clientCount)).toEqual([1, 0]);
+    expect(json.ssids.map((s: { clientCount: number }) => s.clientCount)).toEqual([1, 0]);
+    expect(json.events).toBeUndefined();
+    expect(json.wanStatus.primaryWan).toMatchObject({ rxRate: 0, txRate: 0 });
+    expect(json.wanStatus.backupWan).toMatchObject({ rxRate: 0, txRate: 0 });
+    expect(json.wanStatus.gatewayModel).toBe('ER605');
+
+    // Admins keep the unscoped view
+    vi.spyOn(sessionModule, 'getCurrentSession').mockResolvedValue(ADMIN_SESSION);
+    const adminJson = await (await GET(new Request('http://localhost:3000/api/telemetry?all=true'))).json();
+    expect(adminJson.allClients).toHaveLength(3);
+    expect(adminJson.networks.map((n: { clientCount: number }) => n.clientCount)).toEqual([2, 1]);
+    expect(adminJson.events).toHaveLength(1);
+    expect(adminJson.wanStatus.primaryWan.rxRate).toBe(9000);
+  });
+
+  it('fails closed for non-admins when the device tag lookup throws', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(omadaClientModule, 'getOmadaClient').mockReturnValue({
+      getNetworkStatus: vi.fn().mockResolvedValue({ controllerOnline: true, totalClients: 2, totalTrafficDown: 500 }),
+      getActiveClients: vi.fn().mockResolvedValue([{ mac: '01' }, { mac: '02' }]),
+    } as any);
+    vi.spyOn(sessionModule, 'getCurrentSession').mockResolvedValue({
+      userId: 'user-regular',
+      username: 'jdoe',
+      email: 'jdoe@test.com',
+      role: 'USER',
+      lastActive: Date.now(),
+    });
+    vi.spyOn(dbQueries, 'getUserDeviceTags').mockRejectedValue(new Error('DB down'));
+
+    const json = await (await GET(new Request('http://localhost:3000/api/telemetry'))).json();
+    expect(json.topClients).toEqual([]);
+    expect(json.status.totalClients).toBe(0);
+    expect(json.status.totalTrafficDown).toBe(0);
   });
 
   it('returns 503 when controller is offline', async () => {
@@ -184,6 +316,7 @@ describe('API Route: /api/telemetry', () => {
     };
 
     vi.spyOn(omadaClientModule, 'getOmadaClient').mockReturnValue(mockClientInstance as any);
+    vi.spyOn(console, 'error').mockImplementation(() => {});
 
     const req = new Request('http://localhost:3000/api/telemetry');
     const res = await GET(req);

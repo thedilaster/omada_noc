@@ -1,19 +1,13 @@
 import { NextResponse } from 'next/server';
-import { getCurrentSession } from '@/lib/auth/session';
+import { requireAdmin } from '@/lib/auth/guards';
 import { runComparativeAiInsight } from '@/lib/ai/insights';
 
 export async function POST() {
   try {
-    const session = await getCurrentSession();
-    if (!session) {
-      return NextResponse.json({ error: 'Unauthorized. Active session required.' }, { status: 401 });
-    }
+    const guard = await requireAdmin();
+    if (!guard.ok) return guard.response;
 
-    if (session.role !== 'ADMIN') {
-      return NextResponse.json({ error: 'Forbidden. Administrator privileges required.' }, { status: 403 });
-    }
-
-    const insight = await runComparativeAiInsight(session.userId);
+    const insight = await runComparativeAiInsight(guard.session.userId);
     return NextResponse.json({ success: true, insight });
   } catch (error: unknown) {
     console.error('Run AI insight error:', error);

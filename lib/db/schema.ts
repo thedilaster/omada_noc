@@ -1,4 +1,4 @@
-import { getDbPool, activateMemoryFallback } from './pool';
+import { getDbPool, activateMemoryFallback, isMemoryFallbackAllowed } from './pool';
 import { hashPassword } from '../auth/password';
 import { initMemoryDb } from './memory';
 
@@ -6,11 +6,31 @@ export const DEFAULT_ADMIN_EMAIL = process.env.DEFAULT_ADMIN_EMAIL || 'admin@oma
 export const DEFAULT_ADMIN_PASSWORD = process.env.DEFAULT_ADMIN_PASSWORD || 'AdminPass123!';
 export const DEFAULT_ADMIN_USERNAME = process.env.DEFAULT_ADMIN_USERNAME || 'admin';
 
+// Memoized so concurrent logins share one schema/seed run; cleared on failure to allow retries
+let initPromise: Promise<void> | null = null;
+
 /**
  * Idempotently initializes the database schema (PostgreSQL or In-Memory fallback)
- * and seeds the default admin user.
+ * and seeds the default admin user. Safe to call on every request.
  */
-export async function initDb(): Promise<void> {
+export function initDb(): Promise<void> {
+  if (!initPromise) {
+    initPromise = runInitDb().catch((err) => {
+      initPromise = null;
+      throw err;
+    });
+  }
+  return initPromise;
+}
+
+/**
+ * Clears the memoized initDb() result (test isolation).
+ */
+export function resetInitDbForTests(): void {
+  initPromise = null;
+}
+
+async function runInitDb(): Promise<void> {
   try {
     const pool = getDbPool();
 
@@ -89,13 +109,16 @@ export async function initDb(): Promise<void> {
 
     if (count === 0) {
       const hashed = await hashPassword(DEFAULT_ADMIN_PASSWORD);
+      // ON CONFLICT DO NOTHING: another instance may have seeded between the COUNT and here
       const insertUserRes = await pool.query(
         `INSERT INTO users (username, email, password_hash, role)
          VALUES ($1, $2, $3, 'ADMIN')
+         ON CONFLICT DO NOTHING
          RETURNING id`,
         [DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_EMAIL, hashed]
       );
 
+      if (insertUserRes.rows.length === 0) return;
       const adminId = insertUserRes.rows[0].id;
 
       // Seed Profile
@@ -113,6 +136,11 @@ export async function initDb(): Promise<void> {
       console.log(`======================================================\n`);
     }
   } catch (err: unknown) {
+    // Production (or ALLOW_MEMORY_FALLBACK=false) must surface DB failures instead of silently
+    // serving the in-memory store with its well-known default admin password.
+    if (!isMemoryFallbackAllowed()) {
+      throw err;
+    }
     // If PostgreSQL connection or auth fails (e.g. running locally without Postgres or password mismatch in dev),
     // transparently initialize in-memory fallback.
     const msg = (err as Error).message || 'connection failed';

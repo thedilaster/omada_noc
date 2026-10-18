@@ -169,6 +169,48 @@ describe('ReportsModal Component', () => {
     });
   });
 
+  it('clears a stale error and shows loading again when reopened', async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 500,
+      json: async () => ({ error: 'Hardware unreachable' }),
+    });
+    const { rerender } = render(<ReportsModal isOpen={true} onClose={vi.fn()} />);
+    await waitFor(() => {
+      expect(screen.getByText(/Hardware unreachable/i)).toBeInTheDocument();
+    });
+
+    rerender(<ReportsModal isOpen={false} onClose={vi.fn()} />);
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ success: true, report: mockReport }),
+    });
+    rerender(<ReportsModal isOpen={true} onClose={vi.fn()} />);
+
+    expect(screen.queryByText(/Hardware unreachable/i)).not.toBeInTheDocument();
+    expect(screen.getByText(/Aggregating hardware telemetry/i)).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByText('Workstation-Dev')).toBeInTheDocument();
+    });
+  });
+
+  it('shows an admin-only notice when the security summary is omitted (non-ADMIN viewer)', async () => {
+    const reportWithoutSecurity: Partial<typeof mockReport> = { ...mockReport, topActiveUsers: [] };
+    delete reportWithoutSecurity.securitySummary;
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ success: true, report: reportWithoutSecurity }),
+    });
+
+    render(<ReportsModal isOpen={true} onClose={vi.fn()} />);
+    await waitFor(() => {
+      expect(screen.getByText('Workstation-Dev')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole('button', { name: /Top Operators & Security/i }));
+    expect(screen.getByText(/only available to administrators/i)).toBeInTheDocument();
+    expect(screen.queryByText(/24h Auth Success Rate/i)).not.toBeInTheDocument();
+  });
+
   it('catches PDF generation errors gracefully', async () => {
     const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     global.fetch = vi.fn().mockResolvedValue({

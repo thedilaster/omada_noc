@@ -1,16 +1,15 @@
 import { NextResponse } from 'next/server';
-import { getCurrentSession } from '@/lib/auth/session';
-import { getUserDeviceTags, tagDeviceToUser, removeDeviceTagFromUser } from '@/lib/db/queries';
+import { requireAdmin } from '@/lib/auth/guards';
+import { getUserDeviceTags, tagDeviceToUser, removeDeviceTagFromUser, findUserById } from '@/lib/db/queries';
+import { toCanonicalMac } from '@/lib/db/validation';
 
 export async function GET(
   _request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const session = await getCurrentSession();
-    if (!session || session.role !== 'ADMIN') {
-      return NextResponse.json({ error: 'Forbidden: Admin access required' }, { status: 403 });
-    }
+    const guard = await requireAdmin();
+    if (!guard.ok) return guard.response;
 
     const { id } = await params;
     const tags = await getUserDeviceTags(id);
@@ -26,10 +25,8 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const session = await getCurrentSession();
-    if (!session || session.role !== 'ADMIN') {
-      return NextResponse.json({ error: 'Forbidden: Admin access required' }, { status: 403 });
-    }
+    const guard = await requireAdmin();
+    if (!guard.ok) return guard.response;
 
     const { id } = await params;
     const body = await request.json();
@@ -37,6 +34,19 @@ export async function POST(
 
     if (!macAddress) {
       return NextResponse.json({ error: 'MAC address is required.' }, { status: 400 });
+    }
+
+    if (!toCanonicalMac(typeof macAddress === 'string' ? macAddress : '')) {
+      return NextResponse.json(
+        { error: 'Invalid MAC address. Expected 12 hex digits, e.g. AA-BB-CC-DD-EE-FF.' },
+        { status: 400 }
+      );
+    }
+
+    // Avoid tagging devices to a nonexistent account (FK violation / orphaned memory tag)
+    const user = await findUserById(id);
+    if (!user) {
+      return NextResponse.json({ error: 'User not found' }, { status: 404 });
     }
 
     const tag = await tagDeviceToUser(id, macAddress, deviceName || '');
@@ -56,10 +66,8 @@ export async function DELETE(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const session = await getCurrentSession();
-    if (!session || session.role !== 'ADMIN') {
-      return NextResponse.json({ error: 'Forbidden: Admin access required' }, { status: 403 });
-    }
+    const guard = await requireAdmin();
+    if (!guard.ok) return guard.response;
 
     const { id } = await params;
     const { searchParams } = new URL(request.url);

@@ -62,14 +62,14 @@ export default function ThroughputSparkline({
             strokeLinecap="round"
             strokeLinejoin="round"
           />
-          {/* Pulsing dot on latest reading */}
+          {/* Pulsing dot on latest reading (fill-box so origin-center is the dot, not the viewBox) */}
           {coords.length > 0 && (
             <circle
               cx={coords[coords.length - 1].split(',')[0]}
               cy={coords[coords.length - 1].split(',')[1]}
               r="2.5"
               fill="#22d3ee"
-              className="animate-ping origin-center"
+              className="animate-ping origin-center [transform-box:fill-box]"
             />
           )}
         </svg>

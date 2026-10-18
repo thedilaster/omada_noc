@@ -20,12 +20,13 @@ import {
   getLatestAiInsight,
   resetDbFallbackForTests,
 } from '@/lib/db/queries';
-import { initDb } from '@/lib/db/schema';
+import { initDb, resetInitDbForTests } from '@/lib/db/schema';
 
 describe('Database Queries with Connection and Auth Failure Fallback', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resetDbFallbackForTests();
+    resetInitDbForTests();
   });
 
   it('transparently initializes and falls back to in-memory store on connection refusal', async () => {
@@ -51,9 +52,11 @@ describe('Database Queries with Connection and Auth Failure Fallback', () => {
     const userById = await findUserById(admin!.id);
     expect(userById?.email).toBe('admin@omadanoc.com');
 
-    // 3. createUser
+    // 3. createUser (memory ids are real UUIDs, and no hash leaks into API responses)
     const newUser = await createUser('devuser', 'dev@omadanoc.com', 'hashedpwd', 'USER', 'Dev User');
     expect(newUser.username).toBe('devuser');
+    expect(newUser).not.toHaveProperty('passwordHash');
+    expect((await findUserById(newUser.id))?.username).toBe('devuser');
 
     // 4. updateUserRole
     const updatedRole = await updateUserRole(newUser.id, 'ADMIN');
@@ -75,10 +78,10 @@ describe('Database Queries with Connection and Auth Failure Fallback', () => {
 
     // 8. tagDeviceToUser, getUserDeviceTags, removeDeviceTagFromUser
     const tag = await tagDeviceToUser(newUser.id, 'AA:BB:CC:DD:EE:01', 'Dev Laptop');
-    expect(tag.macAddress).toBe('AA:BB:CC:DD:EE:01');
+    expect(tag.macAddress).toBe('AA-BB-CC-DD-EE-01');
     const tags = await getUserDeviceTags(newUser.id);
     expect(tags.length).toBe(1);
-    const removed = await removeDeviceTagFromUser(newUser.id, 'AA:BB:CC:DD:EE:01');
+    const removed = await removeDeviceTagFromUser(newUser.id, 'aa-bb-cc-dd-ee-01');
     expect(removed).toBe(true);
 
     // 9. recordLoginAttempt & getPaginatedLogins
@@ -131,5 +134,23 @@ describe('Database Queries with Connection and Auth Failure Fallback', () => {
     expect(admin).not.toBeNull();
     expect(admin?.email).toBe('admin@omadanoc.com');
     expect(admin?.role).toBe('ADMIN');
+  });
+
+  it('does not switch to the in-memory store when fallback is disallowed (production)', async () => {
+    vi.stubEnv('NODE_ENV', 'production');
+    vi.stubEnv('ALLOW_MEMORY_FALLBACK', '');
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const connError = Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:5432'), { code: 'ECONNREFUSED' });
+    vi.spyOn(poolModule, 'getDbPool').mockReturnValue({
+      query: vi.fn().mockRejectedValue(connError),
+      connect: vi.fn().mockRejectedValue(connError),
+      on: vi.fn(),
+    } as any);
+
+    await expect(initDb()).rejects.toThrow('ECONNREFUSED');
+    expect(poolModule.isMemoryFallbackActive()).toBe(false);
+    // The well-known default admin must not become a valid login
+    await expect(findUserByEmailOrUsername('admin@omadanoc.com')).rejects.toThrow('ECONNREFUSED');
+    vi.unstubAllEnvs();
   });
 });

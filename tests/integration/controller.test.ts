@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { OmadaClient } from '@/lib/omada/client';
 
-describe('Omada Controller Integration Test', () => {
+// Talks to the real controller, so it only runs on demand: npm run test:integration
+describe.skipIf(process.env.OMADA_INTEGRATION !== '1')('Omada Controller Integration Test', () => {
   it('instantiates and attempts connection to configured controller', async () => {
     const client = new OmadaClient();
     

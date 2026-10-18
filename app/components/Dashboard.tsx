@@ -15,6 +15,7 @@ import ThroughputSparkline from './ThroughputSparkline';
 import WanHealthWidget from './WanHealthWidget';
 import ClientInspectorModal from './ClientInspectorModal';
 import NocEventStreamModal from './NocEventStreamModal';
+import { copyText, useIsClient } from './uiHelpers';
 
 interface DashboardProps {
   initialData: TelemetryResponse;
@@ -29,17 +30,30 @@ export default function Dashboard({ initialData }: DashboardProps) {
   const [sortBy, setSortBy] = useState<'activity' | 'traffic' | 'uptime'>('activity');
   const [activeTab, setActiveTab] = useState<'telemetry' | 'topology' | 'vlan_wifi' | 'hardware_poe'>('telemetry');
   const [isClientsExpanded, setIsClientsExpanded] = useState<boolean>(false);
-  const [selectedClient, setSelectedClient] = useState<OmadaClientDevice | null>(null);
+  // Store only the MAC so the inspector always reflects the latest polled data
+  const [selectedClientMac, setSelectedClientMac] = useState<string | null>(null);
   const [isEventStreamModalOpen, setIsEventStreamModalOpen] = useState<boolean>(false);
   const [throughputHistory, setThroughputHistory] = useState<number[]>([
     Math.round((initialData.status.totalActivityRate || 1024) * 0.75),
     Math.round((initialData.status.totalActivityRate || 1024) * 0.9),
     initialData.status.totalActivityRate || 1024,
   ]);
-  const [copyToast, setCopyToast] = useState<string | null>(null);
-  const [lastRefreshedTime, setLastRefreshedTime] = useState<string>(
-    new Date(initialData.status.lastUpdated).toLocaleTimeString()
-  );
+  const [copyToast, setCopyToast] = useState<{ message: string; ok: boolean } | null>(null);
+  const copyToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    return () => {
+      if (copyToastTimerRef.current) clearTimeout(copyToastTimerRef.current);
+    };
+  }, []);
+  // Keep the raw timestamp in state and only format it on the client: toLocaleTimeString()
+  // depends on the runtime's timezone/locale, which differs between server (UTC) and browser.
+  const [lastRefreshedAt, setLastRefreshedAt] = useState<string>(initialData.status.lastUpdated);
+  const isClient = useIsClient();
+  const parsedRefreshTime = new Date(lastRefreshedAt);
+  const lastRefreshedTime =
+    isClient && !Number.isNaN(parsedRefreshTime.getTime()) ? parsedRefreshTime.toLocaleTimeString() : '';
+  // Guards against overlapping polls: a slow response must not race a newer one
+  const telemetryInFlightRef = useRef<boolean>(false);
   const [isReportsModalOpen, setIsReportsModalOpen] = useState<boolean>(false);
   const [isAiInsightsDrawerOpen, setIsAiInsightsDrawerOpen] = useState<boolean>(false);
   const isAiInsightsDrawerOpenRef = useRef<boolean>(isAiInsightsDrawerOpen);
@@ -153,13 +167,15 @@ export default function Dashboard({ initialData }: DashboardProps) {
   }, []);
 
   const fetchTelemetry = useCallback(async () => {
+    if (telemetryInFlightRef.current) return;
+    telemetryInFlightRef.current = true;
     setLoading(true);
     try {
       const res = await fetch(`/api/telemetry?limit=50&sort=${sortBy}&all=true`);
       if (res.ok) {
         const json: TelemetryResponse = await res.json();
         setData(json);
-        setLastRefreshedTime(new Date().toLocaleTimeString());
+        setLastRefreshedAt(new Date().toISOString());
         if (json.status?.totalActivityRate !== undefined) {
           setThroughputHistory((prev) => [...prev.slice(-14), json.status.totalActivityRate]);
         }
@@ -194,11 +210,18 @@ export default function Dashboard({ initialData }: DashboardProps) {
         },
       }));
     } finally {
+      telemetryInFlightRef.current = false;
       setLoading(false);
     }
   }, [sortBy]);
 
-  const handleCopySnapshot = () => {
+  const showCopyToast = (message: string, ok: boolean) => {
+    if (copyToastTimerRef.current) clearTimeout(copyToastTimerRef.current);
+    setCopyToast({ message, ok });
+    copyToastTimerRef.current = setTimeout(() => setCopyToast(null), 3000);
+  };
+
+  const handleCopySnapshot = async () => {
     const clientsList = data.allClients || data.topClients || [];
     const site = data.status.siteName || data.status.siteId;
     const lines = [
@@ -220,9 +243,13 @@ export default function Dashboard({ initialData }: DashboardProps) {
       ...(data.poeDevices || []).map((p) => `- **${p.name}** (${p.model}): ${p.poeRemain}W headroom remaining (${p.poePowerUsed ?? 0}W draw)`),
     ];
 
-    navigator.clipboard?.writeText(lines.join('\n'));
-    setCopyToast('Diagnostic snapshot copied to clipboard!');
-    setTimeout(() => setCopyToast(null), 3000);
+    const copied = await copyText(lines.join('\n'));
+    showCopyToast(
+      copied
+        ? 'Diagnostic snapshot copied to clipboard!'
+        : 'Clipboard unavailable: could not copy the diagnostic snapshot.',
+      copied
+    );
   };
 
   // Handle auto-refresh interval
@@ -237,6 +264,9 @@ export default function Dashboard({ initialData }: DashboardProps) {
 
   const { status } = data;
   const clients: OmadaClientDevice[] = data.allClients || data.topClients || [];
+  const selectedClient = selectedClientMac
+    ? clients.find((c) => c.mac === selectedClientMac) ?? null
+    : null;
 
   // Filter clients
   const filteredClients = clients
@@ -250,7 +280,8 @@ export default function Dashboard({ initialData }: DashboardProps) {
         const matchesIp = (client.ip || '').toLowerCase().includes(q);
         const matchesMac = (client.mac || '').toLowerCase().includes(q);
         const matchesSsid = (client.ssid || '').toLowerCase().includes(q);
-        return matchesName || matchesHost || matchesIp || matchesMac || matchesSsid;
+        const matchesApName = (client.apName || '').toLowerCase().includes(q);
+        return matchesName || matchesHost || matchesIp || matchesMac || matchesSsid || matchesApName;
       }
       return true;
     })
@@ -321,9 +352,17 @@ export default function Dashboard({ initialData }: DashboardProps) {
             {/* Right-Aligned Status & 50% Enlarged Profile Widget */}
             <div className="flex items-center gap-4 shrink-0">
               <div className="hidden sm:flex flex-col items-end text-right font-mono">
-                <div className="flex items-center gap-2 text-xs text-emerald-400 font-bold">
-                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-                  <span>SYSTEM ONLINE</span>
+                <div
+                  className={`flex items-center gap-2 text-xs font-bold ${
+                    status.controllerOnline ? 'text-emerald-400' : 'text-rose-400'
+                  }`}
+                >
+                  <span
+                    className={`w-2 h-2 rounded-full ${
+                      status.controllerOnline ? 'bg-emerald-400 animate-pulse' : 'bg-rose-400'
+                    }`}
+                  />
+                  <span>{status.controllerOnline ? 'SYSTEM ONLINE' : 'SYSTEM OFFLINE'}</span>
                 </div>
                 <span className="text-[11px] text-slate-500">Heartbeat: {lastRefreshedTime}</span>
               </div>
@@ -545,16 +584,20 @@ export default function Dashboard({ initialData }: DashboardProps) {
 
         {/* Floating Copy Toast Notification */}
         {copyToast && (
-          <div className="fixed bottom-6 left-6 z-50 px-4 py-2.5 rounded-2xl bg-cyan-950 border border-cyan-700 text-cyan-300 text-xs font-mono font-bold shadow-2xl animate-in fade-in slide-in-from-bottom duration-150">
-            ✓ {copyToast}
+          <div
+            role="status"
+            className={`fixed bottom-6 left-6 z-50 px-4 py-2.5 rounded-2xl border text-xs font-mono font-bold shadow-2xl animate-in fade-in slide-in-from-bottom duration-150 ${
+              copyToast.ok
+                ? 'bg-cyan-950 border-cyan-700 text-cyan-300'
+                : 'bg-rose-950 border-rose-700 text-rose-300'
+            }`}
+          >
+            {copyToast.ok ? '✓' : '✕'} {copyToast.message}
           </div>
         )}
 
         {/* Multi-WAN & Starlink Uplink Telemetry Widget */}
-        <WanHealthWidget
-          wanStatus={data.wanStatus}
-          siteActivityRate={data.status?.totalActivityRate}
-        />
+        <WanHealthWidget wanStatus={data.wanStatus} />
 
         {/* Connection Error / Diagnostic Notice Banner */}
         {!status.controllerOnline && !isConnectionNoticeDismissed && (
@@ -953,7 +996,7 @@ export default function Dashboard({ initialData }: DashboardProps) {
                         return (
                           <tr
                             key={client.mac}
-                            onClick={() => setSelectedClient(client)}
+                            onClick={() => setSelectedClientMac(client.mac)}
                             className="hover:bg-slate-800/60 cursor-pointer transition-colors group"
                             title="Click to view deep-dive RF & uplink diagnostics"
                           >
@@ -1257,7 +1300,7 @@ export default function Dashboard({ initialData }: DashboardProps) {
       <ClientInspectorModal
         client={selectedClient}
         networks={data.networks}
-        onClose={() => setSelectedClient(null)}
+        onClose={() => setSelectedClientMac(null)}
       />
 
       {/* Live NOC Event Stream Modal */}

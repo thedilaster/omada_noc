@@ -11,7 +11,8 @@ export function formatBytes(bytes: number | undefined | null, decimals = 2): str
   const sizes = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
 
   const i = Math.floor(Math.log(Math.abs(bytes)) / Math.log(k));
-  const clampedIndex = Math.min(i, sizes.length - 1);
+  // |bytes| < 1 yields a negative index; clamp to the base unit
+  const clampedIndex = Math.max(0, Math.min(i, sizes.length - 1));
 
   return `${parseFloat((bytes / Math.pow(k, clampedIndex)).toFixed(dm))} ${sizes[clampedIndex]}`;
 }
@@ -29,7 +30,8 @@ export function formatRate(bytesPerSecond: number | undefined | null, decimals =
   const sizes = ['B/s', 'KB/s', 'MB/s', 'GB/s'];
 
   const i = Math.floor(Math.log(Math.abs(bytesPerSecond)) / Math.log(k));
-  const clampedIndex = Math.min(i, sizes.length - 1);
+  // |rate| < 1 yields a negative index; clamp to the base unit
+  const clampedIndex = Math.max(0, Math.min(i, sizes.length - 1));
 
   return `${parseFloat((bytesPerSecond / Math.pow(k, clampedIndex)).toFixed(dm))} ${sizes[clampedIndex]}`;
 }
@@ -54,6 +56,48 @@ export function formatUptime(seconds: number | undefined | null): string {
   }
 
   return parts.join(' ');
+}
+
+/**
+ * Whether an Omada device is connected. Prefers `statusCategory` (1 = connected) when the
+ * controller supplies it; otherwise accepts the v5 "Connected" status codes 14-17
+ * (wired, wireless/mesh, and their migrating variants).
+ */
+export function isDeviceOnline(device: { status?: number; statusCategory?: number } | null | undefined): boolean {
+  if (!device) return false;
+  if (typeof device.statusCategory === 'number') return device.statusCategory === 1;
+  return typeof device.status === 'number' && device.status >= 14 && device.status <= 17;
+}
+
+export type SignalBand = 'excellent' | 'good' | 'fair' | 'poor';
+
+/**
+ * Classify a wireless client's signal quality. `rssi` is dBm (> -60 excellent, -60..-70 good,
+ * -70..-80 fair, < -80 poor); when only `signalLevel` (0-100 %) is reported it is banded
+ * separately (>= 75 excellent, >= 50 good, >= 25 fair, < 25 poor). Returns null when neither is known.
+ */
+export function getSignalBand(client: { rssi?: number; signalLevel?: number }): SignalBand | null {
+  if (typeof client.rssi === 'number') {
+    if (client.rssi > -60) return 'excellent';
+    if (client.rssi >= -70) return 'good';
+    if (client.rssi >= -80) return 'fair';
+    return 'poor';
+  }
+  if (typeof client.signalLevel === 'number') {
+    if (client.signalLevel >= 75) return 'excellent';
+    if (client.signalLevel >= 50) return 'good';
+    if (client.signalLevel >= 25) return 'fair';
+    return 'poor';
+  }
+  return null;
+}
+
+/**
+ * Normalize a MAC address to 12 uppercase hex characters for comparison
+ * (Omada returns "AA-BB-CC-DD-EE-FF" while users often type "aa:bb:cc:dd:ee:ff")
+ */
+export function normalizeMac(mac: string | undefined | null): string {
+  return (mac || '').replace(/[^a-fA-F0-9]/g, '').toUpperCase();
 }
 
 /**

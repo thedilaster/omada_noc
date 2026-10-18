@@ -18,6 +18,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import path from 'path';
 import fs from 'fs';
+import { extractJsonObject, stripThinking } from '../lib/ai/ollama';
 
 // Automatically load .env.local if present
 const envPath = path.resolve(process.cwd(), '.env.local');
@@ -49,13 +50,42 @@ async function queryOllama(prompt: string, model = OLLAMA_MODEL): Promise<string
       model,
       prompt,
       stream: false,
-      options: { temperature: 0.2, num_predict: 1024 },
+      options: { temperature: 0.2, num_predict: 4096 },
     }),
     signal: AbortSignal.timeout(60000),
   });
   if (!res.ok) throw new Error(`Ollama error HTTP ${res.status}`);
   const data = (await res.json()) as { response?: string };
   return data.response || '';
+}
+
+/** Keyword routing used when Ollama is offline or its tool selection can't be parsed. */
+function selectToolHeuristically(input: string): { toolName: string; toolArgs: Record<string, unknown> } {
+  const lower = input.toLowerCase();
+  // Word boundaries: "ap" must not match "happening", "laptop", ...
+  const has = (pattern: RegExp) => pattern.test(lower);
+  const mentionsAp = has(/\b(aps?|access[- ]points?)\b/);
+  const mentionsSwitch = has(/\bswitch(es)?\b/);
+
+  if (has(/\b(audit|health|score)\b/)) {
+    return { toolName: 'audit_network_health', toolArgs: {} };
+  }
+  if (mentionsAp || mentionsSwitch || has(/\b(devices?|hardware|gateways?)\b/)) {
+    return {
+      toolName: 'get_network_devices',
+      toolArgs: { device_type: mentionsAp ? 'ap' : mentionsSwitch ? 'switch' : 'all' },
+    };
+  }
+  if (has(/\b(inspect|detail|details|why)\b/) || lower.includes('192.')) {
+    return {
+      toolName: 'get_client_detail',
+      toolArgs: { query: input.replace(/inspect|detail|lookup|why is/gi, '').trim() || input },
+    };
+  }
+  if (has(/\b(clients?|bandwidth|traffic)\b/)) {
+    return { toolName: 'get_active_clients', toolArgs: { connection_type: 'wireless', sort_by: 'activity', limit: 5 } };
+  }
+  return { toolName: 'get_network_status', toolArgs: {} };
 }
 
 async function startCopilot() {
@@ -79,10 +109,8 @@ async function startCopilot() {
     env: {
       ...process.env,
       OMADA_URL: process.env.OMADA_URL || '192.168.100.2',
-      OMADA_USER: process.env.OMADA_USER || 'admin',
-      OMADA_PASS: process.env.OMADA_PASS || 'password',
       OMADA_SITE: process.env.OMADA_SITE || 'Default',
-      OMADA_ALLOW_INSECURE_SSL: 'true',
+      // OMADA_ALLOW_INSECURE_SSL is inherited from the environment (TLS verification stays on unless it is "true")
     },
   });
 
@@ -119,8 +147,7 @@ async function startCopilot() {
       console.log('\n🤔 \x1b[33mSelecting MCP Tool & Reasoning...\x1b[0m');
 
       try {
-        let toolName = 'get_network_status';
-        let toolArgs: Record<string, unknown> = {};
+        let { toolName, toolArgs } = selectToolHeuristically(input);
 
         if (isOllamaOnline) {
           // Use real Neural LLM to select tool & parameters
@@ -139,29 +166,14 @@ Respond ONLY with a valid JSON object (no markdown, no other text):
 
           try {
             const llmSelection = await queryOllama(toolSelectionPrompt);
-            const jsonMatch = llmSelection.match(/\{[\s\S]*\}/);
-            if (jsonMatch) {
-              const parsed = JSON.parse(jsonMatch[0]);
-              if (parsed.tool) toolName = parsed.tool;
-              if (parsed.args) toolArgs = parsed.args;
+            // Strip <think> reasoning first so braces in it can't be mistaken for the answer
+            const parsed = extractJsonObject<{ tool?: unknown; args?: unknown }>(stripThinking(llmSelection));
+            if (parsed && typeof parsed.tool === 'string') {
+              toolName = parsed.tool;
+              toolArgs = parsed.args && typeof parsed.args === 'object' ? (parsed.args as Record<string, unknown>) : {};
             }
           } catch {
-            // Fallback to heuristic parser
-          }
-        } else {
-          // Heuristic Fallback when Ollama is offline
-          const lower = input.toLowerCase();
-          if (lower.includes('audit') || lower.includes('health') || lower.includes('score')) {
-            toolName = 'audit_network_health';
-          } else if (lower.includes('ap') || lower.includes('switch') || lower.includes('device') || lower.includes('hardware')) {
-            toolName = 'get_network_devices';
-            toolArgs = { device_type: lower.includes('ap') ? 'ap' : lower.includes('switch') ? 'switch' : 'all' };
-          } else if (lower.includes('inspect') || lower.includes('detail') || lower.includes('why') || lower.includes('192.')) {
-            toolName = 'get_client_detail';
-            toolArgs = { query: input.replace(/inspect|detail|lookup|why is/gi, '').trim() || input };
-          } else if (lower.includes('client') || lower.includes('bandwidth') || lower.includes('traffic')) {
-            toolName = 'get_active_clients';
-            toolArgs = { connection_type: 'wireless', sort_by: 'activity', limit: 5 };
+            // Keep the heuristic selection
           }
         }
 
@@ -190,9 +202,8 @@ ${rawTelemetry}
 Provide a concise, direct, and actionable answer to the user's question based strictly on this real telemetry.`;
 
           const answer = await queryOllama(synthesisPrompt);
-          // Strip think tags if present
-          const cleanAnswer = answer.replace(/<think>[\s\S]*?<\/think>/i, '').trim();
-          console.log(cleanAnswer);
+          // Strip think tags (closed or truncated) if present
+          console.log(stripThinking(answer) || '(The model returned only reasoning; no final answer.)');
         } else {
           console.log('\n' + rawTelemetry);
         }

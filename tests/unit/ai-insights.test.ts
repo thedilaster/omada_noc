@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { runComparativeAiInsight } from '@/lib/ai/insights';
+import { runComparativeAiInsight, runDeepSeekAgentInsight, AiAuditUnavailableError } from '@/lib/ai/insights';
 import * as dbQueries from '@/lib/db/queries';
 
 describe('Iterative AI Insights Engine (lib/ai/insights.ts)', () => {
@@ -30,7 +30,7 @@ describe('Iterative AI Insights Engine (lib/ai/insights.ts)', () => {
         total: 1,
       }),
       getDevices: vi.fn().mockResolvedValue([
-        { mac: '00:11:22:33:44:01', name: 'AP-1', type: 'ap', status: 1 },
+        { mac: '00:11:22:33:44:01', name: 'AP-1', type: 'ap', status: 14 },
       ]),
     };
 
@@ -89,8 +89,8 @@ describe('Iterative AI Insights Engine (lib/ai/insights.ts)', () => {
         total: 1,
       }),
       getDevices: vi.fn().mockResolvedValue([
-        { mac: '00:11:22:33:44:01', name: 'AP-1', type: 'ap', status: 1 },
-        { mac: '00:11:22:33:44:02', name: 'AP-Barn', type: 'ap', status: 1 },
+        { mac: '00:11:22:33:44:01', name: 'AP-1', type: 'ap', status: 14 },
+        { mac: '00:11:22:33:44:02', name: 'AP-Barn', type: 'ap', status: 14 },
       ]),
     };
 
@@ -177,7 +177,7 @@ describe('Iterative AI Insights Engine (lib/ai/insights.ts)', () => {
         total: 1,
       }),
       getDevices: vi.fn().mockResolvedValue([
-        { mac: 'AP-1', name: 'AP-1', type: 'ap', status: 1 },
+        { mac: 'AP-1', name: 'AP-1', type: 'ap', status: 14 },
       ]),
     };
 
@@ -209,7 +209,7 @@ describe('Iterative AI Insights Engine (lib/ai/insights.ts)', () => {
     const mockClient = {
       getNetworkStatus: vi.fn().mockResolvedValue({ siteName: 'The Farm' }),
       getActiveClients: vi.fn().mockResolvedValue({ clients: mockIotClients, total: 7 }),
-      getDevices: vi.fn().mockResolvedValue([{ mac: 'AP-1', name: 'AP-1', type: 'ap', status: 1 }]),
+      getDevices: vi.fn().mockResolvedValue([{ mac: 'AP-1', name: 'AP-1', type: 'ap', status: 14 }]),
       getLanNetworks: vi.fn().mockResolvedValue([{ id: 'net-20', name: 'Smart Home (IoT)', vlan: 20 }]),
       getSsids: vi.fn().mockResolvedValue([{ id: 'ssid-iot', name: 'TheFarmIot', bandText: '2.4G' }]),
       getWanStatus: vi.fn().mockResolvedValue({ primaryWan: { latencyMs: 24, online: true } }),
@@ -288,7 +288,7 @@ Everything is optimal.
       getActiveClients: vi.fn().mockResolvedValue([
         { mac: 'AA:11', name: 'Workstation', wireless: true, channel: 36 },
       ]),
-      getDevices: vi.fn().mockResolvedValue([{ mac: 'AP-1', name: 'AP-1', type: 'ap', status: 1 }]),
+      getDevices: vi.fn().mockResolvedValue([{ mac: 'AP-1', name: 'AP-1', type: 'ap', status: 14 }]),
       getLanNetworks: vi.fn().mockResolvedValue([{ id: 'net-20', name: 'IoT', vlan: 20 }]),
       getSsids: vi.fn().mockResolvedValue([{ id: 's1', name: 'TheFarmIot', bandText: '2.4G' }]),
     };
@@ -301,6 +301,167 @@ Everything is optimal.
     expect(insight.healthScore).toBe(95);
     expect(insight.executiveSummary).toContain('DeepSeek-R1 verified');
     expect(insight.narration?.currentStatus).toBe('Optimal posture.');
+  });
+
+  describe('telemetry guards (no baseline poisoning)', () => {
+    const offlineClient = () => ({
+      getNetworkStatus: vi.fn().mockResolvedValue({ controllerOnline: false, error: 'connect ETIMEDOUT' }),
+      getActiveClients: vi.fn().mockRejectedValue(new Error('down')),
+      getDevices: vi.fn().mockRejectedValue(new Error('down')),
+    });
+
+    it('refuses to run or save an algorithmic audit while the controller is offline', async () => {
+      vi.spyOn(dbQueries, 'getRecentAiInsights').mockResolvedValue([{ id: 'prev', healthScore: 70, newIssues: [], persistingIssues: [] } as any]);
+      const saveSpy = vi.spyOn(dbQueries, 'saveAiInsight');
+
+      const run = runComparativeAiInsight('user-1', offlineClient() as any);
+      await expect(run).rejects.toBeInstanceOf(AiAuditUnavailableError);
+      await expect(run).rejects.toThrow(/controller is offline or unreachable \(connect ETIMEDOUT\).*no record was saved/);
+      expect(saveSpy).not.toHaveBeenCalled();
+    });
+
+    it('treats an unknown network status or a failed device inventory as unavailable telemetry', async () => {
+      vi.spyOn(dbQueries, 'getRecentAiInsights').mockResolvedValue([]);
+      const saveSpy = vi.spyOn(dbQueries, 'saveAiInsight');
+
+      const noStatus = {
+        getNetworkStatus: vi.fn().mockRejectedValue(new Error('boom')),
+        getActiveClients: vi.fn().mockResolvedValue([]),
+        getDevices: vi.fn().mockResolvedValue([]),
+      };
+      await expect(runComparativeAiInsight(null, noStatus as any)).rejects.toThrow(/offline or unreachable\. AI audit skipped/);
+
+      const noDevices = {
+        getNetworkStatus: vi.fn().mockResolvedValue({ controllerOnline: true }),
+        getActiveClients: vi.fn().mockResolvedValue([]),
+        getDevices: vi.fn().mockRejectedValue(new Error('500')),
+      };
+      await expect(runComparativeAiInsight(null, noDevices as any)).rejects.toThrow(/telemetry is incomplete/);
+      expect(saveSpy).not.toHaveBeenCalled();
+    });
+
+    it('refuses to run the DeepSeek engine (no inference, no save) while the controller is offline', async () => {
+      vi.spyOn(dbQueries, 'getRecentAiInsights').mockResolvedValue([]);
+      const saveSpy = vi.spyOn(dbQueries, 'saveAiInsight');
+      const fetchSpy = vi.fn();
+      global.fetch = fetchSpy;
+
+      await expect(runDeepSeekAgentInsight('user-1', offlineClient() as any)).rejects.toBeInstanceOf(AiAuditUnavailableError);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(saveSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  it('flags weak clients from signalLevel % when RSSI is missing and measures bursts from activity + uploadActivity', async () => {
+    vi.spyOn(dbQueries, 'getRecentAiInsights').mockResolvedValue([
+      { id: 'prev', createdAt: '2026-08-28T10:00:00Z', healthScore: 90, newIssues: [], persistingIssues: [] } as any,
+    ]);
+    vi.spyOn(dbQueries, 'saveAiInsight').mockImplementation(async (data: any) => ({ ...data, id: 'i', createdAt: 'now' }));
+
+    const mockClient = {
+      getNetworkStatus: vi.fn().mockResolvedValue({ controllerOnline: true }),
+      getActiveClients: vi.fn().mockResolvedValue([
+        { mac: 'W1', name: 'Weak-Pct', wireless: true, channel: 36, signalLevel: 10 },
+        { mac: 'W2', name: 'Strong-Pct', wireless: true, channel: 36, signalLevel: 90 },
+        { mac: 'B1', name: 'Uploader', wireless: false, activity: 4_000_000, uploadActivity: 3_000_000 },
+        { mac: 'P1', name: 'Fast-PHY', wireless: false, rxRate: 2_400_000, txRate: 2_400_000 },
+      ]),
+      getDevices: vi.fn().mockResolvedValue([{ mac: 'AP-1', name: 'AP-1', type: 'ap', status: 0, statusCategory: 1 }]),
+    };
+
+    const insight = await runComparativeAiInsight('user-1', mockClient as any);
+
+    const weak = insight.newIssues.filter((i) => i.category === 'RF_SIGNAL');
+    expect(weak.map((i) => i.affectedEntities?.[0])).toEqual(['W1']);
+    expect(weak[0].description).toContain('10% signal level');
+    const bursts = insight.newIssues.filter((i) => i.category === 'BANDWIDTH_BURST');
+    expect(bursts.map((i) => i.affectedEntities?.[0])).toEqual(['B1']);
+    expect(bursts[0].description).toContain('56 Mbps');
+    expect(insight.newIssues.some((i) => i.category === 'DEVICE_OFFLINE')).toBe(false);
+    expect(insight.narration?.historyContext).not.toMatch(/Starlink|24 ms/);
+    expect((insight.metricsSnapshot as any).siteName).toBe('Unknown');
+  });
+
+  describe('runDeepSeekAgentInsight response handling', () => {
+    const onlineClient = () => ({
+      getNetworkStatus: vi.fn().mockResolvedValue({ controllerOnline: true, siteName: 'HQ' }),
+      getActiveClients: vi.fn().mockResolvedValue([
+        { mac: 'L', name: 'Light-User', wireless: false, activity: 100 },
+        { mac: 'H', name: 'Heavy-User', wireless: false, activity: 9_000_000 },
+        { mac: 'M', name: 'Mid-User', wireless: true, channel: 36, rssi: -85, activity: 50_000 },
+      ]),
+      getDevices: vi.fn().mockResolvedValue([
+        { mac: 'AP-1', name: 'AP-1', type: 'ap', status: 14 },
+        { mac: 'AP-2', name: 'AP-2', type: 'ap', status: 30 },
+      ]),
+    });
+
+    const mockOllama = (response: string) => {
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ model: 'deepseek-r1:7b', response }),
+      });
+      global.fetch = fetchMock;
+      return fetchMock;
+    };
+
+    beforeEach(() => {
+      vi.spyOn(dbQueries, 'getRecentAiInsights').mockResolvedValue([]);
+      vi.spyOn(dbQueries, 'saveAiInsight').mockImplementation(async (data: any) => ({ ...data, id: 'ds', createdAt: 'now' }));
+    });
+
+    it('ignores braces inside the chain-of-thought, sanitizes lists, and sends top consumers sorted by activity', async () => {
+      const fetchMock = mockOllama(
+        '<think>Maybe {"healthScore": 10}? No.</think>\nVerdict: {"healthScore": "81", "trendDirection": "BOGUS", "issues": "none", ' +
+          '"suggestions": ["text", {"title": "Rebalance", "priority": "URGENT"}]}'
+      );
+
+      const insight = await runDeepSeekAgentInsight('user-admin', onlineClient() as any);
+
+      expect(insight.healthScore).toBe(81);
+      expect(insight.trendDirection).toBe('INITIAL');
+      expect(insight.newIssues).toEqual([]);
+      expect(insight.actionableSuggestions).toEqual([
+        { id: 'llm-sug-0', priority: 'MEDIUM', title: 'Rebalance', action: '', expectedImpact: '' },
+      ]);
+      expect(insight.thinkingProcess).toContain('healthScore": 10');
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.options.num_predict).toBe(4096);
+      const payload = JSON.parse(body.prompt.split('Live Omada Telemetry:\n')[1]);
+      expect(payload.topBandwidthConsumers.map((c: any) => c.name)).toEqual(['Heavy-User', 'Mid-User', 'Light-User']);
+      expect(payload.offlineHardware.map((d: any) => d.name)).toEqual(['AP-2']);
+      expect(payload.onlineHardware.map((d: any) => d.name)).toEqual(['AP-1']);
+      expect(payload.weakClients.map((c: any) => c.name)).toEqual(['Mid-User']);
+      expect(payload.siteName).toBe('HQ');
+    });
+
+    it('computes the trend against the previous audit when the model omits a valid one', async () => {
+      vi.spyOn(dbQueries, 'getRecentAiInsights').mockResolvedValue([{ id: 'p', healthScore: 70 } as any]);
+      mockOllama('{"healthScore": 64, "issues": [{"title": "AP-2 down", "severity": "CRITICAL", "category": "DEVICE_OFFLINE"}, {"severity": "LOUD"}]}');
+
+      const insight = await runDeepSeekAgentInsight('user-admin', onlineClient() as any);
+      expect(insight.trendDirection).toBe('DEGRADED');
+      expect(insight.scoreDelta).toBe(-6);
+      expect(insight.newIssues[0]).toMatchObject({ title: 'AP-2 down', severity: 'CRITICAL', category: 'DEVICE_OFFLINE' });
+      expect(insight.newIssues[1]).toMatchObject({ id: 'llm-issue-1', severity: 'INFO', category: 'GENERAL', title: 'Observed Condition' });
+    });
+
+    it('returns an error and saves nothing when the model output has no parseable verdict', async () => {
+      const saveSpy = vi.spyOn(dbQueries, 'saveAiInsight');
+
+      for (const response of [
+        'I am unable to produce JSON today.',
+        '<think>Reasoning that was cut off by num_predict {"healthScore": 50',
+        '{"executiveSummary": "no score here"}',
+      ]) {
+        mockOllama(response);
+        await expect(runDeepSeekAgentInsight('user-admin', onlineClient() as any)).rejects.toThrow(
+          /did not return a parseable JSON verdict/
+        );
+      }
+      expect(saveSpy).not.toHaveBeenCalled();
+    });
   });
 
   it('tests isIotClient helper directly across VLANs, SSIDs, and vendor keywords', async () => {

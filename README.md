@@ -133,6 +133,17 @@ npm run dev
 
 Open [http://localhost:3000](http://localhost:3000) in your browser and sign in with `admin@omadanoc.com` / `AdminPass123!`.
 
+### 4. Podman Without Compose
+
+`scripts/podman-up.sh` runs Postgres and the dashboard in one rootless pod, reading `.env.local` (see `.env.dist` for every variable, including the required `JWT_SECRET`):
+
+```bash
+cp .env.dist .env.local   # then fill it in
+scripts/podman-up.sh      # --build to rebuild the image, --down to stop
+```
+
+It binds to `127.0.0.1:3000` by default; set `BIND_ADDR=0.0.0.0` for LAN access.
+
 ---
 
 ## 🛡️ Role-Based Access Control (RBAC) Matrix

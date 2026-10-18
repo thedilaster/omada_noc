@@ -3,6 +3,13 @@
 import React from 'react';
 import { PoeDeviceBudget, OmadaDeviceItem } from '@/types/omada';
 import { formatUptime, formatMac } from '@/lib/omada/formatters';
+import { getDeviceStatus } from './uiHelpers';
+
+const STATUS_PILL = {
+  online: { label: 'Online', className: 'bg-emerald-950 border-emerald-800 text-emerald-300' },
+  offline: { label: 'Offline', className: 'bg-rose-950 border-rose-800 text-rose-300' },
+  unknown: { label: 'Unknown', className: 'bg-amber-950 border-amber-800 text-amber-300' },
+} as const;
 
 interface HardwarePoeViewProps {
   poeDevices?: PoeDeviceBudget[];
@@ -55,6 +62,7 @@ export default function HardwarePoeView({
               const total = dev.totalPoePower || 65;
               const used = dev.poePowerUsed !== undefined ? dev.poePowerUsed : Math.max(0, +(total - dev.poeRemain).toFixed(1));
               const pct = Math.min(100, Math.round((used / total) * 100));
+              const statusPill = STATUS_PILL[getDeviceStatus(dev)];
 
               return (
                 <div
@@ -65,8 +73,8 @@ export default function HardwarePoeView({
                     <div>
                       <div className="flex items-center gap-2">
                         <h4 className="text-sm font-bold text-white font-mono">{dev.name}</h4>
-                        <span className="px-2 py-0.5 rounded-full text-[10px] font-mono bg-emerald-950 border border-emerald-800 text-emerald-300 font-semibold">
-                          Online
+                        <span className={`px-2 py-0.5 rounded-full text-[10px] font-mono border font-semibold ${statusPill.className}`}>
+                          {statusPill.label}
                         </span>
                       </div>
                       <p className="text-xs text-slate-400 font-mono mt-0.5">
